@@ -3,6 +3,8 @@
   import { onMount } from "svelte";
   import Section from "./Section.svelte";
   import { buildConfig } from "./buildconfig.svelte.js";
+  import { pushLog, clearLog, linesOf, logText } from "./runlog.svelte.js";
+  import LogView from "./LogView.svelte";
 
   let { onFinished, onShowOnMap } = $props();
 
@@ -26,7 +28,7 @@
       jar = await invoke("download_planetiler");
       jarDefault = jar;
     } catch (err) {
-      stateFor(area).lines = [...cur.lines, `ERROR: ${err}`];
+      pushLog(area, `ERROR: ${err}`, { level: "error" });
     } finally {
       off();
       fetching = null;
@@ -59,7 +61,7 @@
   let runState = $state({});
   const BLANK = {
     running: false, phase: "", label: "", percent: 0, runningStep: null,
-    lines: [], commands: {}, cli: {}, results: [], status: {}, runError: "", done: null,
+    commands: {}, cli: {}, results: [], status: {}, runError: "", done: null,
     /// Cancel has been pressed; the run is stopping at its next checkpoint.
     cancelling: false,
     /// The shared resource this run is queued behind, when it is waiting rather than working.
@@ -67,16 +69,16 @@
   };
   function stateFor(name) {
     if (!runState[name]) {
-      runState[name] = { ...BLANK, lines: [], commands: {}, cli: {}, results: [], status: {} };
+      runState[name] = { ...BLANK, commands: {}, cli: {}, results: [], status: {} };
     }
     return runState[name];
   }
   /** The selected area's run. Everything the progress panel draws reads from here. */
   let cur = $derived(runState[area] ?? BLANK);
   let running = $derived(cur.running);
-  /// How much of the log is rendered. The whole buffer is kept and copied; painting all of it
-  /// would rebuild a megabyte-sized text node on every progress line.
-  const TAIL = 2000;
+  /// The log lives in `runlog.svelte.js`, shared with the strip that is visible from every tab.
+  let lineCount = $derived(linesOf(area).length);
+  let logOpen = $state(true);
   /** What is on disk, per step: the app never decides "already built" from a record alone. */
   let built = $state({});
   let force = $state(new Set());
@@ -436,7 +438,7 @@
 
   async function reveal(path) {
     try { await invoke("reveal", { path }); }
-    catch (err) { stateFor(area).lines = [...cur.lines, `ERROR: ${err}`]; }
+    catch (err) { pushLog(area, `ERROR: ${err}`, { level: "error" }); }
   }
 
   /// Steps whose description is showing. The prose comes from the backend, so the graph and
@@ -462,7 +464,7 @@
     try {
       // the commands go with it: a pasted log without them cannot be diagnosed
       const head = Object.values(cur.commands).map((argv) => `$ ${argv.join(" ")}`);
-      await navigator.clipboard.writeText([...head, "", ...cur.lines].join("\n"));
+      await navigator.clipboard.writeText([...head, "", logText(area)].join("\n"));
       logCopied = true;
       setTimeout(() => (logCopied = false), 1200);
     } catch {}
@@ -507,10 +509,7 @@
         // like an older schema
         state.commands = { ...state.commands, [ev.step]: ev.argv };
         break;
-      // 20k lines is about an hour of planetiler at a 1s log interval. It used to be 400,
-      // which threw away the start of the run - including the command line - within seconds.
       case "log":
-        state.lines = [...state.lines.slice(-20000), ev.line];
         // the backend says so before it starts waiting; it is the difference between a step
         // that is queued and one that has hung
         if (ev.line.startsWith("waiting: ")) state.waitingFor = ev.line.slice(9);
@@ -533,11 +532,12 @@
     const state = stateFor(at);
     Object.assign(state, {
       ...BLANK, running: true,
-      lines: [], commands: {}, cli: {}, results: [],
+      commands: {}, cli: {}, results: [],
       // queued up front, so the list reads as a plan rather than filling in as it goes
       status: Object.fromEntries(planned.map((id) => [id, { state: "queued" }])),
     });
     const attempted = [...planned];
+    clearLog(at);
     try {
       await invoke("run_steps", {
         req: {
@@ -552,7 +552,7 @@
       // shown beside the button as well as logged: a run refused up front produces no
       // events at all, so the log alone leaves the UI looking simply inert
       state.runError = String(err);
-      state.lines = [...state.lines, `ERROR: ${err}`];
+      pushLog(at, `ERROR: ${err}`, { level: "error" });
     } finally {
       state.running = false;
       state.cancelling = false;
@@ -575,7 +575,7 @@
     const state = stateFor(which);
     state.cancelling = true;
     try { await invoke("cancel_run", { area: which }); }
-    catch (err) { state.lines = [...state.lines, `ERROR: ${err}`]; state.cancelling = false; }
+    catch (err) { pushLog(which, `ERROR: ${err}`, { level: "error" }); state.cancelling = false; }
   }
 
   /// Read the run's result off the per-step state rather than the `finished` events alone:
@@ -938,7 +938,7 @@
   <!-- progress belongs with the button that starts it: as its own section it sat below every
        per-step options panel, off the bottom of the window, so a run that failed instantly
        looked like a run that did nothing -->
-  {#if running || cur.lines.length || cur.results.length}
+  {#if running || lineCount || cur.results.length}
     <div class="progress">
       <div class="phead">
         <span class="pstep">
@@ -974,16 +974,19 @@
         </details>
       {/each}
 
-      <details class="group" open={cur.results.some((r) => !r.ok)}>
-        <summary>
-          Log <span class="lines">{cur.lines.length} lines</span>
-          <button class="ghost tiny" onclick={(e) => { e.preventDefault(); copyLog(); }}>
-            {logCopied ? "copied" : "copy"}
+      <div class="logbox">
+        <div class="loghead">
+          <button class="ghost tiny" onclick={() => (logOpen = !logOpen)}>
+            {logOpen ? "▾" : "▸"} Log <span class="lines">{lineCount.toLocaleString()} lines</span>
           </button>
-        </summary>
-        <pre>{#if cur.lines.length > TAIL}… {cur.lines.length - TAIL} earlier lines, in `copy`
-{/if}{cur.lines.slice(-TAIL).join("\n")}</pre>
-      </details>
+          <button class="ghost tiny" onclick={copyLog}>{logCopied ? "copied" : "copy with commands"}</button>
+        </div>
+        <!-- a button and an `{#if}`, not a <details open={...}>: the open state is the reader's,
+             and nothing a progress update does should be able to take it back -->
+        {#if logOpen}
+          <LogView {area} height="360px" labels={Object.fromEntries(steps.map((s) => [s.id, s.label]))} />
+        {/if}
+      </div>
     </div>
   {/if}
 </Section>
@@ -1129,6 +1132,8 @@
      reading it is the whole point of keeping it */
   .cmd .argv { max-height: 320px; color: var(--text-3); font-size: 11px; white-space: pre;
                word-break: normal; }
+  .logbox { margin-top: 10px; }
+  .loghead { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
   .lines { color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
   /* builds in other areas: one row each, and clicking one goes there */
   .othersbar { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }

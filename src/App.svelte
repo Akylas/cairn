@@ -5,6 +5,15 @@
   import Settings from "./lib/Settings.svelte";
   import Docs from "./lib/Docs.svelte";
   import Runs from "./lib/Runs.svelte";
+  import { startLogging } from "./lib/runlog.svelte.js";
+  import { onMount } from "svelte";
+
+  // every step event becomes a log line, whichever tab is open
+  onMount(() => {
+    let stop = () => {};
+    startLogging().then((off) => (stop = off));
+    return () => stop();
+  });
 
   let tab = $state("areas");
   let areasRef = $state(null);

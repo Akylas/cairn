@@ -90,6 +90,14 @@ pub async fn run(
         })
         .await;
 
+    // what the build would otherwise only complain about once per tile, hours in
+    if step == StepId::ValhallaTiles {
+        let config = job.args.windows(2).find(|w| w[0] == "-c").map(|w| PathBuf::from(&w[1]));
+        for warning in config.iter().flat_map(|c| config_warnings(c, &job.working_dir)) {
+            let _ = tx.send(StepEvent::Log { step, line: warning }).await;
+        }
+    }
+
     let mut child = Command::new(&job.program)
         .args(&job.args)
         .current_dir(&job.working_dir)
@@ -160,11 +168,25 @@ async fn out_done(
 
 /// Turn a log line into an event, promoting the stage markers to phases.
 async fn emit(tx: &mpsc::Sender<StepEvent>, step: StepId, parse: LineParser, line: String) {
+    // The tools colour what they print unless told not to, and the escape codes end up in the
+    // log as text - and, worse, in the middle of the markers the parsers look for.
+    let line = crate::progress::strip_ansi(&line);
     match parse(step, &line) {
         // A phase is extra information *about* the line, not a replacement for it - the log
         // still has to show the banner the tool printed.
         event @ StepEvent::Phase { .. } => {
+            // A tool with no percentage of its own at least has a place in its sequence, and a
+            // bar that sits at 0% for an hour reads as a hung process.
+            let reading = match (&event, stage_percent(&line)) {
+                (StepEvent::Phase { name, .. }, Some(percent)) => {
+                    Some(StepEvent::Progress { step, label: name.clone(), percent })
+                }
+                _ => None,
+            };
             let _ = tx.send(event).await;
+            if let Some(reading) = reading {
+                let _ = tx.send(reading).await;
+            }
             let _ = tx.send(StepEvent::Log { step, line }).await;
         }
         // A progress reading replaces its line. The line it came from is either a restatement
@@ -181,21 +203,56 @@ async fn emit(tx: &mpsc::Sender<StepEvent>, step: StepId, parse: LineParser, lin
 
 /// The Valhalla tools' own format, and the default for anything that has no parser of its own.
 ///
-/// `valhalla_build_tiles` announces each stage as `[INFO] Parsing files: ...` or
-/// `[INFO] Building tiles ...`; anything else is ordinary chatter.
+/// `valhalla_build_tiles` announces each stage as `[INFO] Parsing files for ways: ...` or
+/// `[INFO] Building 2 tiles with 18 threads...`; anything else is ordinary chatter.
 pub fn valhalla_line(step: StepId, line: &str) -> StepEvent {
-    match phase_of(line) {
+    let clean = crate::progress::strip_ansi(line);
+    match phase_of(&clean) {
         Some(name) => StepEvent::Phase { step, name },
-        None => StepEvent::Log { step, line: line.to_string() },
+        None => StepEvent::Log { step, line: clean },
     }
 }
 
-/// Recognise the stage banners Valhalla prints, so the UI can show where a long build is.
+/// The stages of `valhalla_build_tiles`, in the order it runs them: what to look for in an info
+/// line, what to call the stage, and roughly how far through the build it is.
 ///
-/// `valhalla_build_tiles` announces each stage as `[INFO] Parsing files: ...` or
-/// `[INFO] Building tiles ...`; anything else is ordinary chatter.
+/// The percentages are positions in the sequence, not shares of the time: parsing a continent's
+/// ways and the enhancer take hours and the stages between them seconds. They exist so that a
+/// build that is working does not look like one that is not - and they are only ever read from
+/// banners the tool prints, so a change in its wording costs a stage name, never a build.
+const STAGES: [(&str, &str, u8); 14] = [
+    ("Parsing files for ways", "Parsing ways", 3),
+    ("Parsing files for relations", "Parsing relations", 20),
+    ("Parsing files for nodes", "Parsing nodes", 24),
+    ("Creating graph edges from ways", "Creating graph edges", 38),
+    ("Sorting graph", "Sorting graph", 42),
+    ("Reclassifying_V2 link", "Classifying links", 46),
+    ("tiles with", "Building tiles", 50),
+    ("Enhancing local graph", "Enhancing the graph", 58),
+    ("GraphFilter", "Filtering", 80),
+    ("HierarchyBuilder", "Building the hierarchy", 83),
+    ("Creating shortcuts on level", "Creating shortcuts", 87),
+    ("Adding complex turn restrictions", "Adding turn restrictions", 91),
+    ("Validating, finishing and binning", "Validating tiles", 94),
+    ("Binning inter-tile", "Binning edges", 97),
+];
+
+fn info_of(line: &str) -> Option<&str> {
+    Some(line.split_once("[INFO] ")?.1)
+}
+
+/// Where in the build this line says it is, for a tool that does not report a percentage.
+pub fn stage_percent(line: &str) -> Option<u8> {
+    let rest = info_of(line)?;
+    STAGES.iter().find(|(needle, ..)| rest.contains(needle)).map(|(.., percent)| *percent)
+}
+
+/// Recognise the stage banners Valhalla prints, so the UI can show where a long build is.
 fn phase_of(line: &str) -> Option<String> {
-    let rest = line.split_once("[INFO] ")?.1;
+    let rest = info_of(line)?;
+    if let Some((_, name, _)) = STAGES.iter().find(|(needle, ..)| rest.contains(needle)) {
+        return Some((*name).to_string());
+    }
     const BANNERS: [&str; 8] = [
         "Parsing files",
         "Building",
@@ -208,6 +265,35 @@ fn phase_of(line: &str) -> Option<String> {
     ];
     let banner = BANNERS.iter().find(|b| rest.starts_with(**b))?;
     Some(rest.split(':').next().unwrap_or(banner).trim().to_string())
+}
+
+/// Things wrong with a Valhalla config that the build will only mention much later, once per
+/// tile, in a log nobody is reading.
+///
+/// `valhalla.json` names the admin and time zone databases; without them the graph is built
+/// anyway, minus the country and time zone data that country-specific routing rules and opening
+/// hours depend on - and the build says "Admin db not found" for every tile of a continent.
+pub fn config_warnings(config: &Path, working_dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(config) else { return Vec::new() };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (key, what, tool) in [
+        ("admin", "admin boundary", "valhalla_build_admins"),
+        ("timezone", "time zone", "valhalla_build_timezones"),
+    ] {
+        let Some(path) = json["mjolnir"][key].as_str() else { continue };
+        let resolved = working_dir.join(path);
+        if !resolved.exists() {
+            out.push(format!(
+                "warning: {} names a {what} database that does not exist ({}). The graph will be \
+                 built without that data, and the build prints a warning for every tile. \
+                 `{tool}` makes it.",
+                config.display(),
+                resolved.display()
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -233,5 +319,48 @@ mod tests {
         assert_eq!(phase_of("[INFO] 1000 nodes processed"), None);
         assert_eq!(phase_of("[WARN] Building something"), None);
         assert_eq!(phase_of("no marker at all"), None);
+    }
+
+    /// The tools colour the level tag, which puts an escape between `[INFO]` and the space the
+    /// banner search looked for - so with colour on, no stage was ever recognised.
+    #[test]
+    fn coloured_output_is_still_recognised() {
+        let raw = "2026-10-13 16:26:11.745131 \x1b[32;1m[INFO]\x1b[0m Parsing files for ways: europe.osm.pbf";
+        match valhalla_line(StepId::ValhallaTiles, raw) {
+            StepEvent::Phase { name, .. } => assert_eq!(name, "Parsing ways"),
+            other => panic!("expected a phase, got {other:?}"),
+        }
+        match valhalla_line(StepId::ValhallaTiles, "x \x1b[33;1m[WARN]\x1b[0m Admin db not found.")
+        {
+            StepEvent::Log { line, .. } => assert!(!line.contains('\x1b'), "{line:?}"),
+            other => panic!("expected a log line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_stages_only_move_forward() {
+        let percents: Vec<u8> = STAGES.iter().map(|(.., p)| *p).collect();
+        assert!(percents.windows(2).all(|w| w[0] < w[1]), "{percents:?}");
+        assert_eq!(stage_percent("t [INFO] Building 2 tiles with 18 threads..."), Some(50));
+        assert_eq!(stage_percent("t [INFO] Finished with 6473 graph edges"), None);
+        assert_eq!(stage_percent("t [WARN] Building tiles with problems"), None);
+    }
+
+    #[test]
+    fn a_missing_admin_database_is_said_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("valhalla.json");
+        std::fs::write(
+            &config,
+            r#"{"mjolnir": {"admin": "tiles/admins.sqlite", "timezone": "tiles/tz.sqlite"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config_warnings(&config, dir.path()).len(), 2);
+        std::fs::create_dir_all(dir.path().join("tiles")).unwrap();
+        std::fs::write(dir.path().join("tiles/admins.sqlite"), b"").unwrap();
+        let left = config_warnings(&config, dir.path());
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("valhalla_build_timezones"), "{left:?}");
+        assert!(config_warnings(&dir.path().join("nope.json"), dir.path()).is_empty());
     }
 }

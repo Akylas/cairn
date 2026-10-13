@@ -48,7 +48,8 @@ async function devInvoke(cmd, args) {
       return (await fetch(`${DEV_BASE}/build-state/${args.area}`)).json();
     // builds only happen inside the app, so in the browser there is never one in flight
     case "active_runs":
-      return [];
+      // a test can put runs here: window.__runs = [{ area, step, phase, percent, ... }]
+      return window.__runs ?? [];
     // command lines are built by the app from its real settings; the browser has none to use
     case "cli_script":
       return [];
@@ -144,8 +145,20 @@ export async function invoke(cmd, args) {
   return real(cmd, args);
 }
 
+// In the browser there is no backend to send events, so handlers are kept where a test can reach
+// them: `window.__emit("step", {...})` plays one, which is how a log full of lines can be looked
+// at without running a build.
+const devHandlers = new Map();
+if (!inTauri && typeof window !== "undefined") {
+  window.__emit = (event, payload) =>
+    (devHandlers.get(event) ?? []).forEach((h) => h({ event, payload }));
+}
+
 export async function listen(event, handler) {
-  if (!inTauri) return () => {};
+  if (!inTauri) {
+    devHandlers.set(event, [...(devHandlers.get(event) ?? []), handler]);
+    return () => devHandlers.set(event, (devHandlers.get(event) ?? []).filter((h) => h !== handler));
+  }
   const { listen: real } = await import("@tauri-apps/api/event");
   return real(event, handler);
 }
