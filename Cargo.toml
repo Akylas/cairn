@@ -14,3 +14,13 @@ resolver = "2"
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+# `tauri dev` builds without optimisation, and the terrain render is a hot loop over millions of
+# pixels that calls into libwebp, an image decoder and SQLite: unoptimised, the same build runs
+# an order of magnitude slower. The dependencies are optimised once and cached, and the pipeline
+# crate gets enough to be usable; the app shell stays quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.cairn-core]
+opt-level = 2

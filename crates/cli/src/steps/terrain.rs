@@ -4,7 +4,8 @@ use anyhow::{anyhow, Context, Result};
 use cairn_core::elevation::Encoding;
 use cairn_core::settings::Settings;
 use cairn_core::steps::{state, StepId};
-use cairn_core::terrain::{render, source};
+use cairn_core::terrain::archive::ResumeMode;
+use cairn_core::terrain::{build, render, source};
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
@@ -74,6 +75,11 @@ pub struct Args {
     /// Print what would be built, and stop.
     #[arg(long)]
     pub dry_run: bool,
+    /// Discard a partial build left by an interrupted run and start from the beginning. Without
+    /// it, a run that finds one made with the same settings continues it, and one made with
+    /// different settings is refused.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 /// The option values this run is defined by, for the build record.
@@ -102,41 +108,6 @@ fn terrain_options(args: &Args) -> std::collections::BTreeMap<String, serde_json
         values.insert("bounds".into(), bounds.clone().into());
     }
     values
-}
-
-/// Whether a tile is inside the shape, or within `buffer` tiles of it.
-///
-/// The buffer is measured in tiles at this zoom, so the ring is the same width everywhere on the
-/// pyramid rather than a fixed distance that means different things at z5 and z13.
-fn touches(shape: &cairn_core::poly::Polygon, z: u8, x: u32, y: u32, buffer: u32) -> bool {
-    let (w, s, e, n) = render::tile_bounds(z, x, y);
-    if buffer == 0 {
-        return shape.intersects_rect(w, s, e, n);
-    }
-    let dx = (e - w) * buffer as f64;
-    let dy = (n - s) * buffer as f64;
-    shape.intersects_rect(w - dx, s - dy, e + dx, n + dy)
-}
-
-/// Tiles rendered per batch. The batch is what bounds how many encoded tiles are held in memory
-/// at once; big enough that every worker has a contiguous run to walk, small enough that a zoom
-/// of thirty thousand tiles is not all resident.
-const BATCH: usize = 256;
-
-/// Add up what every worker's copy of a source did, so the run reports one figure per source
-/// rather than one per thread.
-fn totals(pool: &render::RenderPool) -> Vec<(String, cairn_core::terrain::tiles::TileStats)> {
-    let mut out: Vec<(String, cairn_core::terrain::tiles::TileStats)> = Vec::new();
-    for source in pool.sources() {
-        let Ok(source) = source.lock() else { continue };
-        for (name, stats) in source.reports() {
-            match out.iter_mut().find(|(known, _)| *known == name) {
-                Some((_, total)) => total.merge(&stats),
-                None => out.push((name, stats)),
-            }
-        }
-    }
-    out
 }
 
 fn parse_bounds(raw: &str) -> Result<(f64, f64, f64, f64)> {
@@ -182,9 +153,11 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
         Err(e) => return Err(e),
     };
     let (composite, skipped) = source::CompositeSource::open(&specs)?;
-    println!("sources, highest priority first: {:?}", composite.names());
-    for note in &skipped {
-        println!("  skipped {note}");
+    if args.dry_run {
+        println!("sources, highest priority first: {:?}", composite.names());
+        for note in &skipped {
+            println!("  skipped {note}");
+        }
     }
     if composite.names().is_empty() {
         return Err(anyhow!("no usable elevation sources in {}", sources_path.display()));
@@ -290,59 +263,47 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
         output.display()
     );
 
-    let mut archive = cairn_core::terrain::archive::TerrainArchive::create(
-        &output,
-        archive_format,
-        &format!("{}_{suffix}", args.area),
-        &opts,
-        bounds,
-        &args.format,
-    )?;
     let started = std::time::Instant::now();
-    let mut written = 0u64;
-
-    // One renderer per worker. Opening them costs a GeoTIFF directory read apiece, so no more are
-    // made than there are tiles to render - a three-tile build must not pay for eighteen.
-    let biggest = {
-        let (x0, y0, x1, y1) = render::tile_range(opts.maxzoom, bounds);
-        ((x1 - x0 + 1) as usize) * ((y1 - y0 + 1) as usize)
+    let job = build::Job {
+        specs: &specs,
+        opts: &opts,
+        bounds,
+        shape: shape.as_ref(),
+        shape_file: args.poly_shape.as_deref(),
+        tile_buffer: args.tile_buffer,
+        format: &args.format,
+        archive_format,
+        output: &output,
+        name: &format!("{}_{suffix}", args.area),
+        mode: if args.fresh { ResumeMode::Fresh } else { ResumeMode::Auto },
+        batch: build::BATCH,
     };
-    let pool = render::RenderPool::new(biggest, || Ok(source::CompositeSource::open(&specs)?.0))?;
-    println!("  {} render threads", pool.len());
 
-    for zoom in opts.minzoom..=opts.maxzoom {
-        let (x0, y0, x1, y1) = render::tile_range(zoom, bounds);
-        let step = render::step_for(
-            opts.encoding,
-            zoom,
-            opts.maxzoom,
-            opts.round_digits,
-            opts.max_round_digits,
-        );
-        // column-major, so a worker's run of tiles stays next to itself on the map and its
-        // sources' caches keep hitting
-        let wanted: Vec<(u32, u32)> = (x0..=x1)
-            .flat_map(|x| (y0..=y1).map(move |y| (x, y)))
-            .filter(|&(x, y)| {
-                shape.as_ref().is_none_or(|s| touches(s, zoom, x, y, args.tile_buffer))
-            })
-            .collect();
-        let total = wanted.len();
-        let mut done = 0usize;
-        // a batch at a time, so the encoded tiles of a whole zoom are never all in memory at once
-        for batch in wanted.chunks(BATCH) {
-            for (x, y, bytes) in pool.render(zoom, batch, &opts, &args.format)? {
-                archive.add(zoom, x, y, &bytes)?;
-                written += 1;
+    // a progress line is redrawn in place, so a log line has to clear it first
+    let mut drawing = false;
+    let outcome = build::run(&job, &|| false, &mut |event| {
+        use std::io::Write;
+        match event {
+            build::Event::Log(line) => {
+                if drawing {
+                    print!("\r\x1b[K");
+                    drawing = false;
+                }
+                println!("  {line}");
             }
-            done += batch.len();
-            print!("\r  z{zoom} ({step} m steps) {done}/{total}   ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+            build::Event::Phase(_) => {}
+            build::Event::Progress { label, percent } => {
+                print!("\r  {label} {percent}%   ");
+                let _ = std::io::stdout().flush();
+                drawing = true;
+            }
         }
-        println!();
+    })?;
+    println!();
+    if !outcome.finished {
+        println!("stopped with {} tiles written; run it again to continue", outcome.written);
+        return Ok(());
     }
-    archive.finish()?;
 
     state::mark_done(
         &area_dir,
@@ -351,21 +312,10 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
         &recorded,
     )?;
 
-    // a tiled source that could not read a tile leaves a hole nobody will notice until they look
-    // at that part of the map, so what each one did is said here rather than inferred later
-    for (name, stats) in totals(&pool) {
-        println!("  {name}: {stats}");
-        if stats.unreadable > 0 {
-            println!(
-                "  warning: {name} left {} tiles unread; this archive has holes",
-                stats.unreadable
-            );
-        }
-    }
-
     let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     println!(
-        "wrote {written} tiles, {} in {:.1}s",
+        "wrote {} tiles, {} in {:.1}s",
+        outcome.written,
         super::mb(size),
         started.elapsed().as_secs_f64()
     );

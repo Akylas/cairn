@@ -49,6 +49,38 @@ async function devInvoke(cmd, args) {
     // builds only happen inside the app, so in the browser there is never one in flight
     case "active_runs":
       return [];
+    // command lines are built by the app from its real settings; the browser has none to use
+    case "cli_script":
+      return [];
+    // the real file is the app's to write; the browser keeps its own copy so the editor can be
+    // developed and looked at without building the app
+    case "get_sources": {
+      let specs;
+      try { specs = JSON.parse(localStorage.getItem("devSources")); } catch { specs = null; }
+      return {
+        path: "(browser) sources.json",
+        specs: specs ?? [{
+          name: "mapterhorn", type: "xyz", url: "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp",
+          encoding: "terrarium", maxzoom: 14, clamp_min: -10,
+        }],
+      };
+    }
+    case "save_sources": {
+      const problems = [];
+      args.specs.forEach((s, index) => {
+        if (!s.name) problems.push({ index, field: "name", message: `source ${index + 1} needs a name` });
+        if (s.type === "xyz" && !/\{z\}.*\{x\}.*\{y\}/.test(s.url ?? ""))
+          problems.push({ index, field: "url", message: `${s.name}: the URL needs {z}, {x} and {y} in it` });
+      });
+      if (!problems.length) localStorage.setItem("devSources", JSON.stringify(args.specs));
+      return problems;
+    }
+    case "probe_source":
+      return { ok: true, summary: "works (browser stub): 2113 m at 46N 8E", details: ["xyz: z0-z14, 512-pixel webp tiles", "1 request(s), 212 ms"] };
+    case "terrain_partial":
+      return null;
+    case "terrain_discard_partial":
+      return null;
     case "cancel_run":
       throw new Error("nothing running");
     // the per-area form state lives in the app's config directory; the browser keeps its own

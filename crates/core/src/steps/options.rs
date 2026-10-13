@@ -279,6 +279,12 @@ pub fn terrain_options() -> Vec<OptionDef> {
              from Geofabrik if it is not already beside the extract. Without it a build writes \
              half-filled tiles all around the bounding box. An explicit clip shape wins over this.",
             "off"),
+        opt("fresh", "fresh", "Start over", "Output",
+            OptionKind::Bool,
+            "Discard a partial build left by an interrupted run and begin again. Without it a run \
+             continues one made with the same settings, and refuses one made with different \
+             settings rather than mixing the two.",
+            "continue a matching partial build"),
         opt("poly_shape", "poly-shape", "Clip shape", "Sources",
             OptionKind::Text,
             "Path to an osmosis .poly. Only tiles touching the shape are written.",

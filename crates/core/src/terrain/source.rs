@@ -21,47 +21,63 @@
 //! middle of the fade and not at either end.
 
 use crate::elevation::Encoding;
+use crate::terrain::fetch::Counters;
 use crate::terrain::tiles::{Location, TerrainTiles, TileStats, TilesConfig};
 use crate::terrain::{geotiff::GeoTiff, hgt::HgtSource, lambert93};
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: String,
+    /// For `xyz` and `pmtiles` sources: a `{z}/{x}/{y}` template, or a PMTiles archive to read
+    /// by byte range. mapterhorn publishes both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// Where the data is on disk. A tiled source reached over HTTP names a `url` instead.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "path_is_empty")]
     pub path: PathBuf,
-    #[serde(default)]
+    /// How elevation is packed into the tiles. Terrarium unless said otherwise, which is what
+    /// every public terrain pyramid serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minzoom: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxzoom: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clamp_min: Option<f64>,
     /// Whether missing `.hgt` tiles may be fetched for this source. Defaults to true, matching
     /// `build_terrain_rgb.py`, where only `"download": false` stopped it.
     ///
     /// It matters because a missing tile is not an error anywhere - the renderer simply writes
     /// nothing there, and the hole only shows up as blank terrain much later.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download: Option<bool>,
-    /// For `xyz` and `pmtiles` sources: a `{z}/{x}/{y}` template, or a PMTiles archive to read
-    /// by byte range. mapterhorn publishes both.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// How elevation is packed into the tiles. Terrarium unless said otherwise, which is what
-    /// every public terrain pyramid serves.
-    #[serde(default)]
-    pub encoding: Option<String>,
     /// Where fetched tiles are kept between runs. Defaults to `.cache/terrain-tiles/<name>`
     /// beside `sources.json`; a tiled source is never read without one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub minzoom: Option<u8>,
-    #[serde(default)]
-    pub maxzoom: Option<u8>,
-    #[serde(default)]
-    pub tile_size: Option<u32>,
+    /// Requests in flight at once when this source is prefetched. 24 unless said otherwise;
+    /// raise it for an endpoint that welcomes load, lower it for one that does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    /// Anything else the file holds, kept so that saving it from the app does not drop a key
+    /// this version has never heard of.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+fn path_is_empty(path: &PathBuf) -> bool {
+    path.as_os_str().is_empty()
 }
 
 /// Whether a kind is a tile pyramid rather than a single grid.
@@ -88,8 +104,8 @@ pub fn read_specs(path: &Path) -> Result<Vec<SourceSpec>> {
         match &spec.cache_dir {
             Some(dir) if dir.is_relative() => spec.cache_dir = Some(root.join(dir)),
             // a tiled source with no cache would ask a public endpoint for every tile of every
-            // run, so one is given rather than left off
-            None if is_tiled(&spec.kind) => {
+            // run, so one is given rather than left off. A file on this disk is its own cache.
+            None if is_tiled(&spec.kind) && spec.url.is_some() => {
                 spec.cache_dir =
                     Some(root.join(".cache/terrain-tiles").join(cache_name(&spec.name)))
             }
@@ -97,6 +113,205 @@ pub fn read_specs(path: &Path) -> Result<Vec<SourceSpec>> {
         }
     }
     Ok(specs)
+}
+
+/// A `sources.json` as written, with nothing resolved: relative paths stay relative and no cache
+/// directory is filled in. This is what an editor must show and save back, or opening the file
+/// and closing it again would rewrite every path in it as an absolute one.
+pub fn read_specs_raw(path: &Path) -> Result<Vec<SourceSpec>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // no file yet is an empty list, not an error: saving is what creates it
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Write the list back, in the layout the file has always had, replacing it in one step so a
+/// build that opens it at that moment sees the old list or the new one and never half of either.
+pub fn write_specs(path: &Path, specs: &[SourceSpec]) -> Result<()> {
+    let problems = validate(specs);
+    if let Some(first) = problems.first() {
+        return Err(anyhow!("not saved: {}", first.message));
+    }
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    specs.serialize(&mut serializer)?;
+    out.push(b'\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    std::fs::write(&part, out).with_context(|| format!("writing {}", part.display()))?;
+    std::fs::rename(&part, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// Something wrong with one field of one source.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Problem {
+    pub index: usize,
+    pub field: String,
+    pub message: String,
+}
+
+/// Everything that would make a source list fail or misbehave at the start of a build, found now
+/// instead. Errors only: a source whose files are not on this machine is allowed, because a
+/// machine without the 44 GB raster is a normal one.
+pub fn validate(specs: &[SourceSpec]) -> Vec<Problem> {
+    let mut out = Vec::new();
+    let mut problem = |index: usize, field: &str, message: String| {
+        out.push(Problem { index, field: field.into(), message });
+    };
+    for (index, spec) in specs.iter().enumerate() {
+        let label =
+            if spec.name.is_empty() { format!("source {}", index + 1) } else { spec.name.clone() };
+        if spec.name.trim().is_empty() {
+            problem(index, "name", format!("{label} needs a name"));
+        } else if specs[..index].iter().any(|other| other.name == spec.name) {
+            problem(index, "name", format!("two sources are called `{}`", spec.name));
+        }
+        let has_url = spec.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+        let has_path = !spec.path.as_os_str().is_empty();
+        match spec.kind.as_str() {
+            "xyz" | "tiles" => match spec.url.as_deref() {
+                Some(url) if url.contains("{z}") && url.contains("{x}") && url.contains("{y}") => {}
+                Some(_) => problem(
+                    index,
+                    "url",
+                    format!("{label}: the URL needs {{z}}, {{x}} and {{y}} in it"),
+                ),
+                None => problem(index, "url", format!("{label} needs a URL template")),
+            },
+            "pmtiles" => {
+                if !has_url && !has_path {
+                    problem(index, "url", format!("{label} needs a URL or a file"));
+                }
+            }
+            "raster" | "valhalla" | "hgt" => {
+                if !has_path {
+                    problem(index, "path", format!("{label} needs a path"));
+                }
+            }
+            other => problem(index, "type", format!("{label}: `{other}` is not a source type")),
+        }
+        if let Some(encoding) = &spec.encoding {
+            if Encoding::parse(encoding).is_none() {
+                problem(
+                    index,
+                    "encoding",
+                    format!("{label}: `{encoding}` is not terrarium or mapbox"),
+                );
+            }
+        }
+        if let (Some(min), Some(max)) = (spec.minzoom, spec.maxzoom) {
+            if min > max {
+                problem(
+                    index,
+                    "minzoom",
+                    format!("{label}: min zoom {min} is above max zoom {max}"),
+                );
+            }
+        }
+        if spec.tile_size == Some(0) {
+            problem(index, "tile_size", format!("{label}: tile size cannot be zero"));
+        }
+        if let Some(n) = spec.concurrency {
+            if !(1..=128).contains(&n) {
+                problem(
+                    index,
+                    "concurrency",
+                    format!("{label}: requests in flight must be 1 to 128"),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// What trying a source found.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Probe {
+    pub ok: bool,
+    pub summary: String,
+    pub details: Vec<String>,
+}
+
+/// Open a source and read one elevation out of it, to say whether it works before a build finds out.
+///
+/// The point is in the Alps - high, so that "0 m" means a source returning nothing rather than the
+/// sea - and the tile cache is left off, so trying a source writes nothing.
+pub fn probe(spec: &SourceSpec) -> Probe {
+    let problems = validate(std::slice::from_ref(spec));
+    if let Some(first) = problems.first() {
+        return Probe { ok: false, summary: first.message.clone(), details: Vec::new() };
+    }
+    let started = std::time::Instant::now();
+    let (lon, lat) = (8.0, 46.0);
+    let mut details = Vec::new();
+
+    if is_tiled(&spec.kind) {
+        let mut spec = spec.clone();
+        spec.cache_dir = None;
+        let mut tiles = match open_tiles(&spec) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                return Probe { ok: false, summary: format!("could not open it: {e}"), details }
+            }
+        };
+        let info = tiles.info();
+        details.push(format!(
+            "{}: z{}-z{}, {}-pixel {} tiles",
+            info.kind, info.minzoom, info.maxzoom, info.tile_size, info.extension
+        ));
+        let value = tiles.sample(lon, lat, 30.0);
+        let stats = tiles.stats();
+        details.push(format!(
+            "{} request(s), {:.0} ms",
+            stats.requests,
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+        return match value {
+            Some(metres) => {
+                Probe { ok: true, summary: format!("works: {metres:.0} m at 46N 8E"), details }
+            }
+            None => Probe {
+                ok: false,
+                summary: match stats.last_error {
+                    Some(e) => format!("opened, but reading a tile failed: {e}"),
+                    None => "opened, but has no data at 46N 8E (the Alps)".into(),
+                },
+                details,
+            },
+        };
+    }
+
+    match spec.kind.as_str() {
+        "raster" => match GeoTiff::open(&spec.path) {
+            Ok(_) => Probe { ok: true, summary: "the raster opens".into(), details },
+            Err(e) => Probe { ok: false, summary: format!("could not open it: {e}"), details },
+        },
+        _ => {
+            let files = std::fs::read_dir(&spec.path)
+                .map(|d| {
+                    d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "hgt")).count()
+                })
+                .unwrap_or(0);
+            if files == 0 {
+                Probe {
+                    ok: false,
+                    summary: format!("no .hgt files in {}", spec.path.display()),
+                    details,
+                }
+            } else {
+                Probe { ok: true, summary: format!("{files} .hgt tiles"), details }
+            }
+        }
+    }
 }
 
 /// A source name as a directory name, with anything a path would object to replaced.
@@ -134,6 +349,7 @@ fn open_tiles(spec: &SourceSpec) -> Result<TerrainTiles> {
         minzoom: spec.minzoom,
         maxzoom: spec.maxzoom,
         cache_dir: spec.cache_dir.clone(),
+        concurrency: spec.concurrency.unwrap_or(crate::terrain::tiles::DEFAULT_CONCURRENCY),
     };
     let target = match &spec.url {
         Some(url) => url.clone(),
@@ -146,6 +362,19 @@ fn open_tiles(spec: &SourceSpec) -> Result<TerrainTiles> {
         "xyz" | "tiles" => TerrainTiles::xyz(&target, config),
         _ => TerrainTiles::pmtiles(&Location::parse(&target), config),
     }
+}
+
+/// What the render is about to ask of the sources for one output tile.
+#[derive(Debug, Clone, Copy)]
+pub struct TileQuery {
+    /// west, south, east, north in degrees.
+    pub bounds: (f64, f64, f64, f64),
+    /// Latitude of the tile's centre, which the zoom to read is chosen at.
+    pub centre_lat: f64,
+    /// Ground size of one output pixel, in metres.
+    pub target_m_per_px: f64,
+    /// Output pixels per side.
+    pub size: u32,
 }
 
 pub struct CompositeSource {
@@ -190,6 +419,72 @@ impl CompositeSource {
             }
         }
         Ok((Self { sources }, skipped))
+    }
+
+    /// Pin every tiled source's choice of zoom to the centre of the tile about to be rendered.
+    /// See [`TerrainTiles::set_reference_latitude`].
+    pub fn begin_tile(&mut self, centre_lat: Option<f64>) {
+        for (_, backing) in &mut self.sources {
+            if let Backing::Tiles { tiles, .. } = backing {
+                tiles.set_reference_latitude(centre_lat);
+            }
+        }
+    }
+
+    /// Whether anything in this tile could be sampled at all.
+    ///
+    /// Only a tiled source can say so without being sampled, so anything else - a grid, a raster
+    /// - answers "maybe", and the render does the work. For a build over mapterhorn alone it is
+    /// exact, and it is what stops a tile of open sea costing a quarter of a million lookups to
+    /// find out it holds nothing.
+    pub fn may_cover(&mut self, query: &TileQuery) -> bool {
+        self.begin_tile(Some(query.centre_lat));
+        for (_, backing) in &mut self.sources {
+            match backing {
+                Backing::Tiles { tiles, .. } => {
+                    if tiles.covers(query.bounds, query.size, query.target_m_per_px) {
+                        return true;
+                    }
+                }
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    /// Fetch, ahead of the render, the source tiles these output tiles will read.
+    pub fn prefetch(&mut self, queries: &[TileQuery]) {
+        for (_, backing) in &mut self.sources {
+            let Backing::Tiles { tiles, .. } = backing else { continue };
+            let mut keys = std::collections::BTreeSet::new();
+            for query in queries {
+                tiles.set_reference_latitude(Some(query.centre_lat));
+                if let Some((z, x0, x1, y0, y1)) =
+                    tiles.tiles_under(query.bounds, query.size, query.target_m_per_px)
+                {
+                    for x in x0..=x1 {
+                        for y in y0..=y1 {
+                            keys.insert((z, x, y));
+                        }
+                    }
+                }
+            }
+            tiles.set_reference_latitude(None);
+            let keys: Vec<_> = keys.into_iter().collect();
+            tiles.prefetch(&keys);
+        }
+    }
+
+    /// Live counters of every tiled source, readable while a render holds this source locked.
+    pub fn counters(&self) -> Vec<(String, Arc<Counters>)> {
+        self.sources
+            .iter()
+            .rev()
+            .filter_map(|(name, backing)| match backing {
+                Backing::Tiles { tiles, .. } => Some((name.clone(), tiles.counters())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Source names, highest priority first.
@@ -389,6 +684,109 @@ mod tests {
         let (composite, skipped) = CompositeSource::open(&specs).unwrap();
         assert!(composite.names().is_empty());
         assert!(skipped[0].contains("netcdf"));
+    }
+
+    /// Opening the file in an editor and saving it must not change what it says: relative paths
+    /// stay relative, keys this version does not know are kept, and absent fields stay absent.
+    #[test]
+    fn saving_what_was_read_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sources.json");
+        let original = r##"[
+    {
+        "name": "mapterhorn",
+        "type": "xyz",
+        "url": "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp",
+        "encoding": "terrarium",
+        "maxzoom": 14,
+        "clamp_min": -10.0
+    },
+    {
+        "name": "ign",
+        "type": "raster",
+        "path": "work/out/ign.tif",
+        "licence": "etalab"
+    }
+]
+"##;
+        std::fs::write(&path, original).unwrap();
+        let specs = read_specs_raw(&path).unwrap();
+        assert_eq!(specs[1].path, Path::new("work/out/ign.tif"), "not resolved against the file");
+        assert!(specs[0].cache_dir.is_none(), "no cache directory is invented");
+        write_specs(&path, &specs).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.path().join("sources.json.part").exists());
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_specs_raw(&dir.path().join("none.json")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nothing_invalid_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sources.json");
+        let bad = vec![SourceSpec {
+            name: "x".into(),
+            kind: "xyz".into(),
+            url: Some("https://example.com/tiles.png".into()),
+            ..Default::default()
+        }];
+        let err = write_specs(&path, &bad).unwrap_err().to_string();
+        assert!(err.contains("{z}"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn validation_names_the_field_that_is_wrong() {
+        let spec = |name: &str, kind: &str| SourceSpec {
+            name: name.into(),
+            kind: kind.into(),
+            ..Default::default()
+        };
+        let found = validate(&[
+            spec("a", "xyz"),
+            spec("a", "pmtiles"),
+            spec("", "raster"),
+            spec("c", "netcdf"),
+            SourceSpec { encoding: Some("png".into()), ..spec("d", "valhalla") },
+            SourceSpec { minzoom: Some(9), maxzoom: Some(3), ..spec("e", "valhalla") },
+        ]);
+        let fields: Vec<(usize, &str)> =
+            found.iter().map(|p| (p.index, p.field.as_str())).collect();
+        for expected in [
+            (0, "url"),
+            (1, "name"),
+            (1, "url"),
+            (2, "name"),
+            (2, "path"),
+            (3, "type"),
+            (4, "encoding"),
+            (5, "minzoom"),
+        ] {
+            assert!(fields.contains(&expected), "missing {expected:?} in {fields:?}");
+        }
+        let fine = SourceSpec {
+            url: Some("https://t.example/{z}/{x}/{y}.webp".into()),
+            ..spec("ok", "xyz")
+        };
+        assert!(validate(&[fine]).is_empty());
+    }
+
+    #[test]
+    fn probing_a_directory_without_tiles_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SourceSpec {
+            name: "hgt".into(),
+            kind: "valhalla".into(),
+            path: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let probe = probe(&spec);
+        assert!(!probe.ok);
+        assert!(probe.summary.contains("no .hgt"), "{}", probe.summary);
     }
 
     #[test]

@@ -147,6 +147,50 @@ Nothing is read from a public endpoint twice, which matters because these are fr
 one alpine build at z5-z12 is a few thousand tiles, and re-fetching that on every run is how a
 pipeline gets blocked.
 
+### Reading mapterhorn: endpoint, remote archive or local extract
+
+The three ways of reading mapterhorn cost very different amounts of waiting:
+
+* **`xyz`** asks for every tile separately, the sea included: a tile that does not exist is a
+  request that comes back 404, and over a continent most of the requests are those. A build
+  prefetches the next batch of tiles with `concurrency` requests in flight (24 unless the source
+  says otherwise), which is what makes it bearable, but it is still a request per tile.
+* **`pmtiles` with a `url`** reads the planet archive by byte range. Its directory says which tiles
+  exist, so a tile that does not exist costs no request. A range request takes as long as a tile
+  request, so this is faster only by the requests it saves. It covers z0-z12.
+* **`pmtiles` with a `path`** reads a file on this disk, with no network at all and nothing copied
+  into the tile cache. For anything larger than one region this is the way: extract yours once with
+  [go-pmtiles](https://github.com/protomaps/go-pmtiles) (`--dry-run` first, for the size) and point
+  the source at it:
+
+  ```shell
+  pmtiles extract --bbox=<west>,<south>,<east>,<north> \
+      https://download.mapterhorn.com/planet.pmtiles mapterhorn.pmtiles
+  ```
+
+A 256-pixel output reads the zoom *below* its own, because mapterhorn's tiles are 512 pixels: a z13
+tile at `--tile-size 256` is read from z12, so the planet archive covers a z13 build. A 512-pixel z13
+tile needs z13, which lives in mapterhorn's separate regional `6-x-y.pmtiles` files.
+
+The sources are listed in `sources.json` and edited under Settings, in the app.
+
+### Interrupting and resuming
+
+A terrain build can be stopped - Ctrl-C, the Cancel button, a crash, a closed laptop - and continued.
+It writes its progress as it goes: PMTiles keeps a journal beside its scratch file
+(`<name>.pmtiles.spill` and `<name>.pmtiles.resume`), MBTiles builds into `<name>.mbtiles.partial`. The
+finished archive is only put in place once it is complete, so an unfinished one is never mistaken for
+a built one.
+
+Running the same command again continues from the last finished batch of 256 tiles. It does so only
+when everything that decides what the tiles look like is the same: the options, the bounds and clip
+shape, `sources.json`, the tile buffer. A partial build started with different settings is refused,
+and left alone, rather than finished with a mixture. `--fresh` (the "Start over" option in the app)
+discards it and begins again.
+
+The same applies across a change of cairn itself: when a release changes how tiles are rendered, a
+partial build from the older one is refused for the same reason.
+
 Both are cairn's, not `build_terrain_rgb.py`'s: the python script fails on a `type` it does not
 know.
 

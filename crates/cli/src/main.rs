@@ -93,3 +93,95 @@ async fn main() -> Result<()> {
         Command::State(args) => steps::state::run(&settings, args),
     }
 }
+
+#[cfg(test)]
+mod command_line_tests {
+    //! The command the app shows for a step has to be one this parser accepts. It used to be
+    //! assembled in the web view from the option schema and drifted: it printed `--area_poly`,
+    //! a bare `--`, and an inverted `--no-elevation-download`.
+
+    use super::*;
+    use cairn_core::settings::Settings;
+    use cairn_core::steps::options::{self, OptionKind};
+    use cairn_core::steps::{command, StepId, ALL_STEPS};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// Every option of a step set to something its kind accepts.
+    fn everything(step: StepId, on: bool) -> BTreeMap<String, Value> {
+        options::for_step(step)
+            .into_iter()
+            .map(|def| {
+                let value = match def.kind {
+                    OptionKind::Bool => json!(on),
+                    OptionKind::Int { min, .. } => json!(min.unwrap_or(1).max(1)),
+                    OptionKind::Float { min, .. } => json!(min.unwrap_or(1.0).max(1.0)),
+                    OptionKind::Text => match def.key.as_str() {
+                        // the few text options whose text has a shape
+                        "levels" => json!("0,1"),
+                        "bounds" | "bbox" => json!("1,2,3,4"),
+                        _ => json!("a-value"),
+                    },
+                    OptionKind::Choice { choices } => json!(choices[0]),
+                };
+                (def.key, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn what_the_app_prints_for_every_step_parses() {
+        let mut settings = Settings::for_repo(std::path::PathBuf::from("/work/cairn"));
+        settings.output_root = "/data/out".into();
+        settings.sources_json = "/elsewhere/my sources.json".into();
+        settings.elevation_tiles_dir = "/elsewhere/elevation".into();
+        for step in ALL_STEPS {
+            for on in [true, false] {
+                for extra in [vec![], vec!["--max-point-buffer=4".to_string()]] {
+                    // only the planetiler steps take anything after `--`
+                    if !extra.is_empty() && !matches!(step, StepId::Basemap | StepId::Routes) {
+                        continue;
+                    }
+                    let argv =
+                        command::argv(&settings, step, "europe", &everything(step, on), &extra);
+                    let parsed = Cli::try_parse_from(&argv);
+                    assert!(
+                        parsed.is_ok(),
+                        "{step:?} printed a line the parser refuses:\n  {}\n{}",
+                        command::line(&argv),
+                        parsed.err().map(|e| e.to_string()).unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Parsing is not the same as meaning it: the terrain line has to carry the choices that
+    /// decide what gets built.
+    #[test]
+    fn the_terrain_line_round_trips_its_values() {
+        let settings = Settings::for_repo(std::path::PathBuf::from("/work/cairn"));
+        let values: BTreeMap<String, Value> = [
+            ("maxzoom", json!(13)),
+            ("tile_size", json!(256)),
+            ("encoding", json!("terrarium")),
+            ("pmtiles", json!(true)),
+            ("fresh", json!(true)),
+            ("download_elevation", json!(false)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let argv = command::argv(&settings, StepId::TerrainRgb, "europe", &values, &[]);
+        let Cli { command: Command::Terrain(args), .. } = Cli::try_parse_from(&argv).unwrap()
+        else {
+            panic!("not a terrain command: {argv:?}");
+        };
+        assert_eq!(args.maxzoom, 13);
+        assert_eq!(args.tile_size, 256);
+        assert_eq!(args.encoding, "terrarium");
+        assert!(args.pmtiles && args.fresh && args.no_elevation_download);
+        // the form's default is off, and it is written out because the command line's is on
+        assert!(!args.area_poly);
+    }
+}

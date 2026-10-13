@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod bathymap;
+pub mod command;
 pub mod download;
 pub mod elevation;
 pub mod external;
@@ -246,6 +247,16 @@ pub enum StepEvent {
     Command {
         step: StepId,
         argv: Vec<String>,
+    },
+    /// The `cairn` command line that repeats this step outside the app.
+    ///
+    /// Separate from `Command`, which is the subprocess the step spawns (a JVM, say): this is
+    /// what someone would type, and it exists for every step, native ones included.
+    Cli {
+        step: StepId,
+        argv: Vec<String>,
+        /// The same, quoted for a shell.
+        line: String,
     },
     Phase {
         step: StepId,

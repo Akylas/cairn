@@ -11,7 +11,7 @@ use cairn_core::steps::archive::{self, ArchiveFormat};
 use cairn_core::steps::options::{self, OptionDef};
 use cairn_core::steps::planetiler::{run_cancellable, PlanetilerJob, Schema};
 use cairn_core::steps::{plan, state as build_state, StepEvent, StepId, ALL_STEPS};
-use cairn_core::terrain::archive::TerrainArchive;
+use cairn_core::terrain::archive::{PartialInfo, ResumeMode, TerrainArchive};
 use cairn_core::tileserver::{self, Registry, Source};
 use cairn_core::toolchain::{self, JavaInstall};
 use cairn_core::valhalla::{package, routing};
@@ -536,6 +536,129 @@ async fn list_steps(
 #[tauri::command]
 fn step_options(step: StepId) -> Vec<OptionDef> {
     options::for_step(step)
+}
+
+fn terrain_output(
+    settings: &Settings,
+    area: &str,
+    pmtiles: bool,
+) -> Result<(PathBuf, ArchiveFormat), String> {
+    let format = if pmtiles { ArchiveFormat::PMTiles } else { ArchiveFormat::MBTiles };
+    let name = archive::archive_name(area, StepId::TerrainRgb, format)
+        .ok_or("terrain has an archive name")?;
+    Ok((settings.area_dir(area).join(name), format))
+}
+
+/// What an interrupted terrain build has already written, so the Build view can say that the next
+/// run continues it.
+#[tauri::command]
+async fn terrain_partial(
+    config: State<'_, Config>,
+    area: String,
+    pmtiles: bool,
+) -> Result<Option<PartialInfo>, String> {
+    let (path, format) = terrain_output(&config.get()?, &area, pmtiles)?;
+    tokio::task::spawn_blocking(move || TerrainArchive::partial_info(&path, format))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Throw an interrupted terrain build away.
+#[tauri::command]
+async fn terrain_discard_partial(
+    config: State<'_, Config>,
+    area: String,
+    pmtiles: bool,
+) -> Result<(), String> {
+    let (path, format) = terrain_output(&config.get()?, &area, pmtiles)?;
+    tokio::task::spawn_blocking(move || TerrainArchive::discard_partial(&path, format))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// `sources.json` as the editor sees it.
+#[derive(Serialize)]
+struct SourcesDoc {
+    path: String,
+    specs: Vec<cairn_core::terrain::source::SourceSpec>,
+}
+
+#[tauri::command]
+async fn get_sources(config: State<'_, Config>) -> Result<SourcesDoc, String> {
+    let path = config.get()?.sources_json;
+    let read = path.clone();
+    let specs =
+        tokio::task::spawn_blocking(move || cairn_core::terrain::source::read_specs_raw(&read))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+    Ok(SourcesDoc { path: path.display().to_string(), specs })
+}
+
+/// Save the list. Returns what is wrong with it, and writes nothing, when something is; a
+/// running build has already read the file, so a save never changes one in flight.
+#[tauri::command]
+async fn save_sources(
+    config: State<'_, Config>,
+    specs: Vec<cairn_core::terrain::source::SourceSpec>,
+) -> Result<Vec<cairn_core::terrain::source::Problem>, String> {
+    let path = config.get()?.sources_json;
+    tokio::task::spawn_blocking(move || {
+        let problems = cairn_core::terrain::source::validate(&specs);
+        if problems.is_empty() {
+            cairn_core::terrain::source::write_specs(&path, &specs)
+                .map_err(|e| format!("{e:#}"))?;
+        }
+        Ok(problems)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Try one source, without saving it and without writing anything to its tile cache.
+#[tauri::command]
+async fn probe_source(
+    spec: cairn_core::terrain::source::SourceSpec,
+) -> Result<cairn_core::terrain::source::Probe, String> {
+    tokio::task::spawn_blocking(move || cairn_core::terrain::source::probe(&spec))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// One step's command line, for the Build view to show before anything runs.
+#[derive(Serialize)]
+struct CliLine {
+    step: StepId,
+    argv: Vec<String>,
+    line: String,
+}
+
+/// The `cairn` command line for each step of a plan, as the form holds them now.
+#[tauri::command]
+fn cli_script(
+    config: State<'_, Config>,
+    area: String,
+    steps: Vec<StepId>,
+    values: BTreeMap<StepId, BTreeMap<String, serde_json::Value>>,
+    extra_args: BTreeMap<StepId, String>,
+) -> Result<Vec<CliLine>, String> {
+    let settings = config.get()?;
+    let empty = BTreeMap::new();
+    Ok(steps
+        .into_iter()
+        .map(|step| {
+            let extra = extra_args.get(&step).map(|raw| split_args(raw)).unwrap_or_default();
+            let argv = cairn_core::steps::command::argv(
+                &settings,
+                step,
+                &area,
+                values.get(&step).unwrap_or(&empty),
+                &extra,
+            );
+            CliLine { step, line: cairn_core::steps::command::line(&argv), argv }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1122,7 +1245,7 @@ async fn run_steps(
                             state.completed.push(*step);
                         }
                     }
-                    StepEvent::Log { .. } | StepEvent::Command { .. } => {}
+                    StepEvent::Log { .. } | StepEvent::Command { .. } | StepEvent::Cli { .. } => {}
                 }
             }
             let _ = emitter.emit("step", &RunEvent { area: event_area.clone(), event });
@@ -1140,6 +1263,13 @@ async fn run_steps(
         // load, so an untouched step already carries the README's values - and merging them in
         // again here would make a deliberately cleared field impossible to clear.
         let mut values = req.values.get(&step).cloned().unwrap_or_default();
+        // what repeats this step in a terminal, taken from the form as it is - before the area
+        // boundary below is turned into a path, which the command line does for itself
+        let extra = req.extra_args.get(&step).map(|raw| split_args(raw)).unwrap_or_default();
+        let cli = cairn_core::steps::command::argv(&settings, step, &req.area, &values, &extra);
+        let _ = tx
+            .send(StepEvent::Cli { step, line: cairn_core::steps::command::line(&cli), argv: cli })
+            .await;
         // `area_poly` is cairn's own switch: resolve it to a real clip path, fetching the
         // boundary from Geofabrik on the first build that asks for it.
         let clip_key = if step == StepId::TerrainRgb { "poly_shape" } else { "polygon" };
@@ -1680,10 +1810,6 @@ async fn run_valhalla_tool(
     external::run(job, tx, cancel.receiver()).await.map_err(|e| e.to_string())
 }
 
-/// Tiles rendered per batch before the finished ones are handed to the archive. Bounds how many
-/// encoded tiles are resident at once without starving the workers of contiguous work.
-const TERRAIN_BATCH: usize = 256;
-
 /// Build the terrain pyramid from `.hgt` sources.
 ///
 /// Reads only SRTM `.hgt`, which needs no projection library. The GeoTIFF raster sources in
@@ -1702,7 +1828,7 @@ async fn run_terrain(
     elevation_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<bool, String> {
     use cairn_core::elevation::Encoding;
-    use cairn_core::terrain::{render, source};
+    use cairn_core::terrain::{build, render, source};
 
     let _ = tx.send(StepEvent::Started { step, area: area.to_string() }).await;
 
@@ -1820,14 +1946,19 @@ async fn run_terrain(
     }
 
     let name = format!("{area}_terrain");
-    let partial = output.clone();
     let progress = tx.clone();
     // The render is the longest thing this app does without a subprocess, and it used to be the
     // one place Cancel could not reach: `spawn_blocking` cannot be aborted from outside, so the
-    // token has to be read from inside the loop. Checked per batch rather than per tile - a
-    // batch is a fraction of a second, and per tile would put an atomic load in the hot path.
+    // token has to be read from inside the loop. The loop checks it between batches - a batch is
+    // a few seconds - and a build stopped there keeps what it wrote, so the next run continues it.
     let stop = cancel.clone();
-    let done = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+    let poly_file = text("poly_shape").map(std::path::PathBuf::from);
+    let mode = if values.get("fresh").and_then(|v| v.as_bool()).unwrap_or(false) {
+        ResumeMode::Fresh
+    } else {
+        ResumeMode::Auto
+    };
+    let outcome = tokio::task::spawn_blocking(move || -> Result<build::Outcome, String> {
         // sources.json is the pipeline's own definition of what to read, in priority order;
         // fall back to the bare elevation directory when it is absent
         let specs = source::read_specs(&sources_json).unwrap_or_else(|_| {
@@ -1840,113 +1971,47 @@ async fn run_terrain(
                 ..Default::default()
             }]
         });
-        let (probe, skipped) = source::CompositeSource::open(&specs).map_err(|e| e.to_string())?;
-        for note in skipped {
-            let _ =
-                progress.blocking_send(StepEvent::Log { step, line: format!("skipped {note}") });
-        }
-        drop(probe);
-
-        // one renderer per worker thread; no more of them than there are tiles to render
-        let biggest = {
-            let (x0, y0, x1, y1) = render::tile_range(opts.maxzoom, bounds);
-            ((x1 - x0 + 1) as usize) * ((y1 - y0 + 1) as usize)
-        };
-        let pool =
-            render::RenderPool::new(biggest, || Ok(source::CompositeSource::open(&specs)?.0))
-                .map_err(|e| e.to_string())?;
-        let _ = progress
-            .blocking_send(StepEvent::Log { step, line: format!("{} render threads", pool.len()) });
-        let mut archive = TerrainArchive::create(
-            &output,
-            archive_format,
-            &name,
-            &opts,
+        let job = build::Job {
+            specs: &specs,
+            opts: &opts,
             bounds,
-            if as_png { "png" } else { "webp" },
-        )
-        .map_err(|e| e.to_string())?;
-
-        let format = if as_png { "png" } else { "webp" };
-        for zoom in opts.minzoom..=opts.maxzoom {
-            if stop.is_cancelled() {
-                return Ok(false);
-            }
-            let (x0, y0, x1, y1) = render::tile_range(zoom, bounds);
-            let _ = progress.blocking_send(StepEvent::Phase { step, name: format!("z{zoom}") });
-            // column-major, so each worker walks a run of tiles that sit next to each other
-            let wanted: Vec<(u32, u32)> = (x0..=x1)
-                .flat_map(|x| (y0..=y1).map(move |y| (x, y)))
-                .filter(|&(x, y)| {
-                    let Some(shape) = &shape else { return true };
-                    let (w, s, e, n) = render::tile_bounds(zoom, x, y);
-                    let (dx, dy) = ((e - w) * tile_buffer as f64, (n - s) * tile_buffer as f64);
-                    shape.intersects_rect(w - dx, s - dy, e + dx, n + dy)
-                })
-                .collect();
-            let total = wanted.len() as u64;
-            let mut done = 0u64;
-            for batch in wanted.chunks(TERRAIN_BATCH) {
-                if stop.is_cancelled() {
-                    return Ok(false);
+            shape: shape.as_ref(),
+            shape_file: poly_file.as_deref(),
+            tile_buffer,
+            format: if as_png { "png" } else { "webp" },
+            archive_format,
+            output: &output,
+            name: &name,
+            mode,
+            batch: build::BATCH,
+        };
+        build::run(&job, &|| stop.is_cancelled(), &mut |event| {
+            let _ = match event {
+                build::Event::Log(line) => progress.blocking_send(StepEvent::Log { step, line }),
+                build::Event::Phase(name) => {
+                    progress.blocking_send(StepEvent::Phase { step, name })
                 }
-                let rendered =
-                    pool.render(zoom, batch, &opts, format).map_err(|e| e.to_string())?;
-                for (x, y, bytes) in rendered {
-                    archive.add(zoom, x, y, &bytes).map_err(|e| e.to_string())?;
+                build::Event::Progress { label, percent } => {
+                    progress.blocking_send(StepEvent::Progress { step, label, percent })
                 }
-                done += batch.len() as u64;
-                let _ = progress.blocking_send(StepEvent::Progress {
-                    step,
-                    label: format!("z{zoom}"),
-                    percent: ((done * 100) / total.max(1)).min(100) as u8,
-                });
-            }
-        }
-        if stop.is_cancelled() {
-            return Ok(false);
-        }
-        archive.finish().map_err(|e| e.to_string())?;
-        // a tiled source that could not read a tile leaves a hole nobody will notice until they
-        // look at that part of the map, so what each one did is said out loud - summed over the
-        // workers, because each of them holds its own copy of every source
-        let mut totals: Vec<(String, cairn_core::terrain::tiles::TileStats)> = Vec::new();
-        for worker in pool.sources() {
-            let Ok(worker) = worker.lock() else { continue };
-            for (name, stats) in worker.reports() {
-                match totals.iter_mut().find(|(known, _)| *known == name) {
-                    Some((_, total)) => total.merge(&stats),
-                    None => totals.push((name, stats)),
-                }
-            }
-        }
-        for (name, stats) in totals {
-            let _ =
-                progress.blocking_send(StepEvent::Log { step, line: format!("{name}: {stats}") });
-            if stats.unreadable > 0 {
-                let _ = progress.blocking_send(StepEvent::Log {
-                    step,
-                    line: format!(
-                        "warning: {name} left {} tiles unread; this archive has holes",
-                        stats.unreadable
-                    ),
-                });
-            }
-        }
-        Ok(true)
+            };
+        })
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    if !done {
-        // the archive was never finished, so what is on disk is a partial pyramid that would
-        // still read as "built" on the next run - and a terrain layer with the top zooms
-        // missing is far harder to spot than one that is absent
-        if partial.is_dir() {
-            let _ = std::fs::remove_dir_all(&partial);
-        } else {
-            let _ = std::fs::remove_file(&partial);
-        }
+    if !outcome.finished {
+        let _ = tx
+            .send(StepEvent::Log {
+                step,
+                line: format!(
+                    "stopped with {} tiles written; run it again to continue from here, or tick \
+                     \"Start over\" to discard them",
+                    outcome.written
+                ),
+            })
+            .await;
         return Ok(cancelled(&tx, step).await);
     }
     let _ = tx.send(StepEvent::Finished { step, ok: true, elapsed: None, outputs: vec![] }).await;
@@ -2090,6 +2155,12 @@ pub fn run() {
             list_steps,
             step_options,
             plan_steps,
+            cli_script,
+            get_sources,
+            save_sources,
+            probe_source,
+            terrain_partial,
+            terrain_discard_partial,
             list_presets,
             default_preset_name,
             build_state,

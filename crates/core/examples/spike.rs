@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             }
             StepEvent::Skipped { reason, .. } => println!("SKIPPED {reason}"),
             StepEvent::Command { argv, .. } => println!("$ {}", argv.join(" ")),
-            StepEvent::Log { .. } => {}
+            StepEvent::Log { .. } | StepEvent::Cli { .. } => {}
         }
     }
     let ok = handle.await??;

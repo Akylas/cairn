@@ -10,4 +10,6 @@ export const buildConfig = $state({
   defs: {},
   /** step id -> free-text tool arguments the form has no field for */
   extra: {},
+  /** The `cairn` command line for each step, as the app itself builds it: [{ step, line }]. */
+  lines: [],
 });

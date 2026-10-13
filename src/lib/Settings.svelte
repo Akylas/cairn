@@ -1,5 +1,6 @@
 <script>
   import { invoke } from "./api.js";
+  import Sources from "./Sources.svelte";
 
   let settings = $state(null);
   let saved = $state(false);
@@ -61,6 +62,9 @@
       <input bind:value={settings[key]} />
     </label>
   {/each}
+
+  <h3>Terrain sources</h3>
+  <Sources />
 
   <h3>Tools</h3>
   {#each OPTIONAL as [key, label, hint]}

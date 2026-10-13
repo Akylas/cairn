@@ -3,7 +3,6 @@
   import { onMount } from "svelte";
   import Section from "./Section.svelte";
   import { buildConfig } from "./buildconfig.svelte.js";
-  import { commandFor } from "./cli.js";
 
   let { onFinished, onShowOnMap } = $props();
 
@@ -60,7 +59,7 @@
   let runState = $state({});
   const BLANK = {
     running: false, phase: "", label: "", percent: 0, runningStep: null,
-    lines: [], commands: {}, results: [], status: {}, runError: "", done: null,
+    lines: [], commands: {}, cli: {}, results: [], status: {}, runError: "", done: null,
     /// Cancel has been pressed; the run is stopping at its next checkpoint.
     cancelling: false,
     /// The shared resource this run is queued behind, when it is waiting rather than working.
@@ -68,7 +67,7 @@
   };
   function stateFor(name) {
     if (!runState[name]) {
-      runState[name] = { ...BLANK, lines: [], commands: {}, results: [], status: {} };
+      runState[name] = { ...BLANK, lines: [], commands: {}, cli: {}, results: [], status: {} };
     }
     return runState[name];
   }
@@ -377,7 +376,10 @@
   /// show, so it should not yank anyone over to the map tab.
   const MAPPABLE = ["basemap", "routes", "terrain_rgb"];
 
-  const fmtSize = (b) => (b > 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`);
+  const fmtSize = (b) =>
+    b > 1073741824 ? `${(b / 1073741824).toFixed(1)} GB`
+    : b > 1048576 ? `${(b / 1048576).toFixed(1)} MB`
+    : `${(b / 1024).toFixed(0)} KB`;
   const fmtWhen = (secs) => (secs ? new Date(secs * 1000).toLocaleString() : "");
 
   async function replan() {
@@ -494,6 +496,11 @@
         state.label = ev.label; state.percent = ev.percent;
         mark(state, ev.step, { percent: ev.percent, label: ev.label });
         break;
+      case "cli":
+        // what repeats this step in a terminal; kept apart from `command`, which is the
+        // subprocess it spawns
+        state.cli = { ...state.cli, [ev.step]: ev.line };
+        break;
       case "command":
         // kept out of `lines` so it cannot scroll away: this is the record of which jar ran
         // and which flags reached it, which is the first thing to check when the output looks
@@ -526,7 +533,7 @@
     const state = stateFor(at);
     Object.assign(state, {
       ...BLANK, running: true,
-      lines: [], commands: {}, results: [],
+      lines: [], commands: {}, cli: {}, results: [],
       // queued up front, so the list reads as a plan rather than filling in as it goes
       status: Object.fromEntries(planned.map((id) => [id, { state: "queued" }])),
     });
@@ -625,15 +632,56 @@
   // used to leave only the last-clicked one configurable
   let optionSteps = $derived(planned.length ? planned : [...selected]);
 
+  // The command line for each step, asked of the backend: it is built from the same values and
+  // settings the runner is handed, and checked against the real parser. A copy assembled here
+  // from the option schema had drifted into printing lines the parser refuses.
+  let cliLines = $state([]);
+  let cliTimer;
+  $effect(() => {
+    const request = {
+      area, steps: [...optionSteps], values: $state.snapshot(values),
+      extraArgs: $state.snapshot(extraArgs),
+    };
+    clearTimeout(cliTimer);
+    cliTimer = setTimeout(async () => {
+      if (!request.area || !request.steps.length) { cliLines = []; return; }
+      try { cliLines = await invoke("cli_script", request); }
+      catch { cliLines = []; }
+    }, 150);
+  });
+  const lineFor = (step) => cliLines.find((l) => l.step === step)?.line ?? "";
+
   // the CLI view shows this same run as a command line; it reads what the form holds rather
   // than being told separately, so the two cannot describe different builds
   $effect(() => {
     buildConfig.area = area;
     buildConfig.steps = optionSteps;
-    buildConfig.values = values;
-    buildConfig.defs = optionDefs;
-    buildConfig.extra = extraArgs;
+    buildConfig.lines = cliLines;
   });
+
+  // An interrupted terrain build keeps what it wrote, and the next run continues it. Said here,
+  // because otherwise the only sign of it is a run that is oddly fast to start.
+  let partial = $state(null);
+  async function refreshPartial() {
+    if (!area) { partial = null; return; }
+    try {
+      partial = await invoke("terrain_partial", {
+        area, pmtiles: values.terrain_rgb?.pmtiles === true,
+      });
+    } catch { partial = null; }
+  }
+  $effect(() => {
+    area; values.terrain_rgb?.pmtiles; running;
+    refreshPartial();
+  });
+  async function discardPartial() {
+    try {
+      await invoke("terrain_discard_partial", {
+        area, pmtiles: values.terrain_rgb?.pmtiles === true,
+      });
+    } catch (err) { javaError = String(err); }
+    await refreshPartial();
+  }
 
   // Remember the form, per area.
   $effect(() => {
@@ -816,6 +864,24 @@
     {/if}
   </div>
 
+  {#if cliLines.length}
+    {@const script = cliLines.map((l) => l.line).join("\n")}
+    <details class="group terminal">
+      <summary>
+        Repeat this from a terminal
+        <button class="ghost tiny" onclick={(e) => { e.preventDefault(); copy(script); }}>
+          {copiedLine === script ? "copied" : "copy"}
+        </button>
+      </summary>
+      <pre class="argv">{script}</pre>
+      <p class="muted small">
+        The command line runs exactly the steps shown and ignores what is already built; it
+        carries the paths this app is set to use. Stopping it with Ctrl-C keeps a terrain build's
+        progress, and running the same line again continues it.
+      </p>
+    </details>
+  {/if}
+
   {#if cur.waitingFor}
     <p class="warn runerr">
       Queued: another area is using <code>{cur.waitingFor}</code>. It starts when that one lets go.
@@ -883,6 +949,18 @@
       <div class="bar big"><div class="fill" style="width:{cur.percent}%"></div></div>
       <p class="muted small">{cur.label || cur.phase}</p>
 
+      {#each Object.entries(cur.cli) as [step, line]}
+        <details class="group cmd">
+          <summary>
+            {labelFor(step)} · same from a terminal
+            <button class="ghost tiny" onclick={(e) => { e.preventDefault(); copy(line); }}>
+              {copiedLine === line ? "copied" : "copy"}
+            </button>
+          </summary>
+          <pre class="argv">{line}</pre>
+        </details>
+      {/each}
+
       {#each Object.entries(cur.commands) as [step, argv]}
         <!-- open: seeing which flags reached planetiler is the point of keeping it -->
         <details class="group cmd" open>
@@ -913,8 +991,17 @@
 {#each optionSteps as step, i}
   <Section title={`3.${i + 1} · ${labelFor(step)}`} open={false}
            subtitle={setCountFor(step) ? `${setCountFor(step)} set` : "defaults"}>
-    {#if commandFor(step, area, values[step] ?? {}, optionDefs[step] ?? [], extraArgs[step])}
-      {@const line = commandFor(step, area, values[step] ?? {}, optionDefs[step] ?? [], extraArgs[step])}
+    {#if step === "terrain_rgb" && partial}
+      <p class="warn partial">
+        An interrupted build is here: up to z{partial.zoom}, {partial.tiles.toLocaleString()} tiles,
+        {fmtSize(partial.bytes)}. Running again continues it. It was started with
+        particular settings, and a run with different ones is refused rather than mixed in;
+        tick <em>Start over</em> below to discard it, or
+        <button class="ghost tiny" onclick={discardPartial} disabled={running}>discard it now</button>.
+      </p>
+    {/if}
+    {#if lineFor(step)}
+      {@const line = lineFor(step)}
       <div class="asline">
         <code>{line}</code>
         <button class="ghost tiny" onclick={() => copy(line)}>

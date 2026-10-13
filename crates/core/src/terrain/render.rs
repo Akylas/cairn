@@ -10,7 +10,7 @@
 //! matched fractional steps mapbox is the smaller of the two.
 
 use crate::elevation::Encoding;
-use crate::terrain::source::CompositeSource;
+use crate::terrain::source::{CompositeSource, TileQuery};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +129,18 @@ pub fn ground_resolution(z: u8, y: u32, size: u32) -> f64 {
     40_075_016.686 * lat.cos() / (n * size as f64)
 }
 
+/// What a source has to know about an output tile to read the right part of itself.
+pub fn tile_query(z: u8, x: u32, y: u32, size: u32) -> TileQuery {
+    let n = (1u64 << z) as f64;
+    let centre = std::f64::consts::PI * (1.0 - 2.0 * (y as f64 + 0.5) / n);
+    TileQuery {
+        bounds: tile_bounds(z, x, y),
+        centre_lat: centre.sinh().atan().to_degrees(),
+        target_m_per_px: ground_resolution(z, y, size),
+        size,
+    }
+}
+
 /// Render one tile. Returns `None` when no pixel had coverage, so empty tiles are skipped
 /// rather than written as a wall of sea level.
 pub fn render_tile(
@@ -140,7 +152,13 @@ pub fn render_tile(
 ) -> Option<Vec<u8>> {
     let size = opts.tile_size;
     let step = step_for(opts.encoding, z, opts.maxzoom, opts.round_digits, opts.max_round_digits);
-    let target = ground_resolution(z, y, size);
+    let query = tile_query(z, x, y, size);
+    let target = query.target_m_per_px;
+    // A tile with nothing under it is found out here, for a few lookups, instead of by sampling
+    // every one of its pixels. Over a continent-sized box that is most of the sea.
+    if !source.may_cover(&query) {
+        return None;
+    }
     let mut rgb = vec![0u8; (size * size * 3) as usize];
     let mut covered = false;
 
@@ -235,6 +253,9 @@ pub type EncodedTile = (u32, u32, Vec<u8>);
 /// is actually on.
 pub struct RenderPool {
     sources: Vec<std::sync::Mutex<CompositeSource>>,
+    /// Not a render worker: the one source that fetches ahead of them. Kept apart so that asking
+    /// the network for the next batch never waits on a worker's lock.
+    prefetcher: std::sync::Mutex<CompositeSource>,
 }
 
 impl RenderPool {
@@ -245,7 +266,7 @@ impl RenderPool {
         for _ in 0..size {
             sources.push(std::sync::Mutex::new(open()?));
         }
-        Ok(Self { sources })
+        Ok(Self { sources, prefetcher: std::sync::Mutex::new(open()?) })
     }
 
     pub fn len(&self) -> usize {
@@ -259,6 +280,22 @@ impl RenderPool {
     /// Every renderer, for reading back what the sources did once a build is over.
     pub fn sources(&self) -> &[std::sync::Mutex<CompositeSource>] {
         &self.sources
+    }
+
+    /// The renderers and the prefetcher, which between them did all the fetching.
+    pub fn all_sources(&self) -> impl Iterator<Item = &std::sync::Mutex<CompositeSource>> {
+        self.sources.iter().chain(std::iter::once(&self.prefetcher))
+    }
+
+    /// Fetch what these output tiles will read, ahead of rendering them.
+    ///
+    /// Safe to call while a batch is being rendered: it only touches the prefetcher.
+    pub fn prefetch(&self, zoom: u8, tiles: &[(u32, u32)], opts: &TerrainOptions) {
+        let queries: Vec<_> =
+            tiles.iter().map(|&(x, y)| tile_query(zoom, x, y, opts.tile_size)).collect();
+        if let Ok(mut source) = self.prefetcher.lock() {
+            source.prefetch(&queries);
+        }
     }
 
     /// Render and encode a batch of tiles, in parallel, returning the ones that had coverage.

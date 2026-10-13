@@ -331,7 +331,7 @@ pub async fn run(settings: &Settings, args: Args, routes: bool) -> Result<()> {
                 println!("$ {}", argv.join(" "));
                 log.push(argv.join(" "));
             }
-            StepEvent::Started { .. } | StepEvent::Skipped { .. } => {}
+            StepEvent::Started { .. } | StepEvent::Skipped { .. } | StepEvent::Cli { .. } => {}
         }
     }
 

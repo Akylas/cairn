@@ -310,13 +310,20 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Options that change how a run goes and nothing about what it produces.
+const TRANSIENT_OPTIONS: &[&str] = &["fresh"];
+
 /// Fingerprint a set of option values.
 ///
 /// `BTreeMap` gives a stable key order and `serde_json` a stable rendering of each value, so the
 /// same options always hash the same way without pulling in a hashing crate for what is really
 /// a change detector.
 fn hash_options(options: &BTreeMap<String, Value>) -> String {
-    let canonical = serde_json::to_string(options).unwrap_or_default();
+    // choices about how a run goes rather than what it makes: ticking "start over" must not make
+    // a finished archive look stale
+    let kept: BTreeMap<&String, &Value> =
+        options.iter().filter(|(k, _)| !TRANSIENT_OPTIONS.contains(&k.as_str())).collect();
+    let canonical = serde_json::to_string(&kept).unwrap_or_default();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in canonical.as_bytes() {
         hash ^= *byte as u64;
@@ -516,5 +523,13 @@ mod tests {
         let out = outputs_for(&settings, "world", StepId::Bathymap, &BTreeMap::new());
         // `Path::ends_with` compares components, so the separator does not matter
         assert!(out[0].ends_with("world/world_bathymap.mbtiles"), "{out:?}");
+    }
+
+    #[test]
+    fn a_transient_option_does_not_change_the_fingerprint() {
+        let plain = opts(&[("maxzoom", json!(12))]);
+        let fresh = opts(&[("maxzoom", json!(12)), ("fresh", json!(true))]);
+        assert_eq!(hash_options(&plain), hash_options(&fresh));
+        assert_ne!(hash_options(&plain), hash_options(&opts(&[("maxzoom", json!(13))])));
     }
 }

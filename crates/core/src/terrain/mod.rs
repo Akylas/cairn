@@ -1,6 +1,7 @@
 //! Terrain-RGB generation.
 
 pub mod archive;
+pub mod build;
 pub mod fetch;
 pub mod geotiff;
 pub mod hgt;

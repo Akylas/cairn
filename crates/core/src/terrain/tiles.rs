@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 
-use super::fetch::Fetcher;
+use super::fetch::{Counters, Fetcher};
 use super::pmtiles::{self, Entry, Header, TileType};
 use crate::elevation::Encoding;
 
@@ -69,7 +69,13 @@ pub struct TilesConfig {
     pub maxzoom: Option<u8>,
     /// Where fetched tiles are kept between runs.
     pub cache_dir: Option<PathBuf>,
+    /// Requests in flight at once when a batch of tiles is prefetched. A free public endpoint is
+    /// asked politely: more than a few dozen is a load someone else pays for.
+    pub concurrency: usize,
 }
+
+/// Requests in flight when a source does not say.
+pub const DEFAULT_CONCURRENCY: usize = 24;
 
 impl Default for TilesConfig {
     fn default() -> Self {
@@ -79,8 +85,19 @@ impl Default for TilesConfig {
             minzoom: None,
             maxzoom: None,
             cache_dir: None,
+            concurrency: DEFAULT_CONCURRENCY,
         }
     }
+}
+
+/// What a tiled source says about itself.
+#[derive(Debug, Clone)]
+pub struct TilesInfo {
+    pub kind: &'static str,
+    pub minzoom: u8,
+    pub maxzoom: u8,
+    pub tile_size: u32,
+    pub extension: String,
 }
 
 struct Grid {
@@ -101,6 +118,12 @@ pub struct TileStats {
     pub bytes: u64,
     /// Requests that failed every retry. Each one is a tile missing from the output.
     pub failures: u64,
+    /// Requests the source answered with "nothing here".
+    pub not_found: u64,
+    /// Extra attempts spent on requests that failed the first time.
+    pub retries: u64,
+    /// Summed time of every request, in milliseconds.
+    pub fetch_ms: u64,
     /// Tiles that could not be read or decoded, for any reason.
     pub unreadable: u64,
     pub last_error: Option<String>,
@@ -113,6 +136,9 @@ impl TileStats {
         self.requests += other.requests;
         self.bytes += other.bytes;
         self.failures += other.failures;
+        self.not_found += other.not_found;
+        self.retries += other.retries;
+        self.fetch_ms += other.fetch_ms;
         self.unreadable += other.unreadable;
         if self.last_error.is_none() {
             self.last_error = other.last_error.clone();
@@ -124,13 +150,20 @@ impl std::fmt::Display for TileStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} decoded, {} from the tile cache; {} requests, {:.1} MB, {} failed",
+            "{} decoded, {} from the tile cache; {} requests ({} empty), {:.1} MB, {} failed",
             self.decoded,
             self.from_cache,
             self.requests,
+            self.not_found,
             self.bytes as f64 / 1_048_576.0,
             self.failures
         )?;
+        if self.requests > 0 {
+            write!(f, ", {} ms each", self.fetch_ms / self.requests)?;
+        }
+        if self.retries > 0 {
+            write!(f, ", {} retried", self.retries)?;
+        }
         if self.unreadable > 0 {
             write!(
                 f,
@@ -215,14 +248,28 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(location: &Location, cache: Option<DiskCache>) -> Result<Self> {
-        let backing = match location {
-            Location::Local(path) => Backing::Local(Mutex::new(
-                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?,
-            )),
-            Location::Remote(url) => {
-                Backing::Remote { base: url.clone(), fetcher: Arc::new(Fetcher::new()) }
-            }
+    fn open(
+        location: &Location,
+        cache: Option<DiskCache>,
+        counters: Arc<Counters>,
+    ) -> Result<Self> {
+        let (backing, cache) = match location {
+            // A file on this disk is already as close as a cache would put it; copying every
+            // tile of it into one would only fill the volume with a second copy.
+            Location::Local(path) => (
+                Backing::Local(Mutex::new(
+                    std::fs::File::open(path)
+                        .with_context(|| format!("opening {}", path.display()))?,
+                )),
+                None,
+            ),
+            Location::Remote(url) => (
+                Backing::Remote {
+                    base: url.clone(),
+                    fetcher: Arc::new(Fetcher::with_counters(counters)),
+                },
+                cache,
+            ),
         };
         Ok(Self { backing, cache })
     }
@@ -248,6 +295,7 @@ impl Reader {
         }
     }
 
+    #[cfg(test)]
     fn fetcher(&self) -> Option<&Fetcher> {
         match &self.backing {
             Backing::Remote { fetcher, .. } => Some(fetcher),
@@ -364,10 +412,14 @@ pub struct TerrainTiles {
     order: VecDeque<(u8, u32, u32)>,
     /// What the last lookup answered, to spare the inner loop a hash of its own.
     last: Option<Memo>,
-    from_disk: u64,
-    decoded: u64,
-    errors: u64,
+    counters: Arc<Counters>,
     last_error: Option<String>,
+    /// Latitude the zoom is chosen at, instead of each pixel's own. See [`Self::set_reference_latitude`].
+    reference_lat: Option<f64>,
+    concurrency: usize,
+    /// Whether a tile has been decoded yet, and so whether `tile_size` is the tiles' own rather
+    /// than the caller's guess.
+    size_known: bool,
 }
 
 impl TerrainTiles {
@@ -382,9 +434,11 @@ impl TerrainTiles {
             .filter(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
             .unwrap_or("webp")
             .to_string();
+        let counters = Arc::new(Counters::default());
         let reader = Reader::open(
             &Location::Remote(template.to_string()),
             config.cache_dir.clone().map(DiskCache::new),
+            counters.clone(),
         )?;
         Ok(Self {
             reader,
@@ -399,16 +453,19 @@ impl TerrainTiles {
             grids: HashMap::new(),
             order: VecDeque::new(),
             last: None,
-            from_disk: 0,
-            decoded: 0,
-            errors: 0,
+            counters,
             last_error: None,
+            reference_lat: None,
+            concurrency: config.concurrency.max(1),
+            size_known: false,
         })
     }
 
     /// A PMTiles archive, on disk or read by byte range over HTTP.
     pub fn pmtiles(location: &Location, config: TilesConfig) -> Result<Self> {
-        let reader = Reader::open(location, config.cache_dir.clone().map(DiskCache::new))?;
+        let counters = Arc::new(Counters::default());
+        let reader =
+            Reader::open(location, config.cache_dir.clone().map(DiskCache::new), counters.clone())?;
         let archive = PmArchive::open(&reader)?;
         let header = archive.header.clone();
         Ok(Self {
@@ -423,11 +480,38 @@ impl TerrainTiles {
             grids: HashMap::new(),
             order: VecDeque::new(),
             last: None,
-            from_disk: 0,
-            decoded: 0,
-            errors: 0,
+            counters,
             last_error: None,
+            reference_lat: None,
+            concurrency: config.concurrency.max(1),
+            size_known: false,
         })
+    }
+
+    /// What this source turned out to be, for showing to someone setting it up.
+    pub fn info(&self) -> TilesInfo {
+        TilesInfo {
+            kind: match self.layout {
+                Layout::Xyz => "xyz",
+                Layout::PmTiles(_) => "pmtiles",
+            },
+            minzoom: self.minzoom,
+            maxzoom: self.maxzoom,
+            tile_size: self.tile_size,
+            extension: self.extension.clone(),
+        }
+    }
+
+    /// Choose the zoom at this latitude rather than at each pixel's own.
+    ///
+    /// The target resolution a render asks for is the ground size of one output pixel *at the
+    /// tile's centre*, and it is the same number for every pixel in the tile. Turning it into a
+    /// zoom with each pixel's own latitude put the pixels nearer the equator a hair above a whole
+    /// zoom level, and `ceil` then sent them a level finer: half of every tile read four times
+    /// the source tiles it needed, and for a public endpoint that is four times the requests.
+    /// Pinning the latitude makes the choice the same for the whole tile.
+    pub fn set_reference_latitude(&mut self, lat: Option<f64>) {
+        self.reference_lat = lat;
     }
 
     /// The zoom whose pixels are at least as fine as `target_m_per_px`.
@@ -438,9 +522,12 @@ impl TerrainTiles {
         if target_m_per_px <= 0.0 || target_m_per_px.is_nan() {
             return self.maxzoom;
         }
+        let lat = self.reference_lat.unwrap_or(lat);
         // ground resolution at zoom 0 for this latitude
         let base = 40_075_016.686 * lat.to_radians().cos().abs() / self.tile_size as f64;
-        let zoom = (base / target_m_per_px).log2().ceil();
+        // The tolerance is for a ratio that is a whole number of zooms in exact arithmetic and
+        // lands a few ulps above it in floating point, which `ceil` would turn into one more.
+        let zoom = ((base / target_m_per_px).log2() - 1e-6).ceil();
         if !zoom.is_finite() {
             return self.maxzoom;
         }
@@ -454,7 +541,7 @@ impl TerrainTiles {
                 return Ok(None);
             }
             if let Some(bytes) = cache.read(&cache.tile_path(z, x, y, &self.extension)) {
-                self.from_disk += 1;
+                self.counters.from_disk.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(bytes));
             }
         }
@@ -518,10 +605,11 @@ impl TerrainTiles {
         let loaded = match self.blob(z, x, y) {
             Ok(Some(bytes)) => match self.decode(&bytes) {
                 Ok(grid) => {
-                    self.decoded += 1;
+                    self.counters.decoded.fetch_add(1, Ordering::Relaxed);
                     // a tile that decodes tells us the real pixel size, which the caller only
                     // guessed at; zoom choice from here on uses the truth
                     self.tile_size = grid.size;
+                    self.size_known = true;
                     Some(Arc::new(grid))
                 }
                 Err(e) => {
@@ -549,7 +637,7 @@ impl TerrainTiles {
     }
 
     fn note(&mut self, message: String) {
-        self.errors += 1;
+        self.counters.unreadable.fetch_add(1, Ordering::Relaxed);
         self.last_error = Some(message);
     }
 
@@ -598,27 +686,147 @@ impl TerrainTiles {
         Some(top + (bottom - top) * fy)
     }
 
+    /// The source tiles an output tile reads, as `(zoom, x0, x1, y0, y1)`, ends included.
+    ///
+    /// Worked out the way [`Self::sample`] reads: the first and last pixel centres of the output
+    /// tile, the texels bilinear filtering touches around them, and the tiles those sit in. So a
+    /// tile on this list is one the render can ask for and a tile off it is not - which is what
+    /// lets an output tile with nothing under it be skipped, and a batch be prefetched, without
+    /// guessing at a margin.
+    pub fn tiles_under(
+        &self,
+        bounds: (f64, f64, f64, f64),
+        out_size: u32,
+        target_m_per_px: f64,
+    ) -> Option<(u8, u32, u32, u32, u32)> {
+        let (west, south, east, north) = bounds;
+        let limit = 85.05;
+        let (south, north) = (south.clamp(-limit, limit), north.clamp(-limit, limit));
+        let zoom = self.zoom_for((south + north) / 2.0, target_m_per_px);
+        let count = (1u64 << zoom) as f64;
+        let size = self.tile_size as f64;
+        let world_x = |lon: f64| (lon + 180.0) / 360.0 * count * size;
+        let world_y = |lat: f64| {
+            let r = lat.to_radians();
+            (1.0 - (r.tan() + 1.0 / r.cos()).ln() / std::f64::consts::PI) / 2.0 * count * size
+        };
+        let (x_west, x_east) = (world_x(west), world_x(east));
+        let (y_north, y_south) = (world_y(north), world_y(south));
+        let (half_x, half_y) = (
+            (x_east - x_west) / out_size as f64 / 2.0,
+            (y_south - y_north) / out_size as f64 / 2.0,
+        );
+        let first_x = (x_west + half_x - 0.5).floor();
+        let last_x = (x_east - half_x - 0.5).floor() + 1.0;
+        let first_y = (y_north + half_y - 0.5).floor();
+        let last_y = (y_south - half_y - 0.5).floor() + 1.0;
+        let tile = |texel: f64| (texel / size).floor().clamp(0.0, count - 1.0) as u32;
+        Some((zoom, tile(first_x), tile(last_x), tile(first_y), tile(last_y)))
+    }
+
+    /// Whether any tile under the output tile exists. `true` when it cannot tell yet.
+    ///
+    /// The answer is exact for a tileset whose tile size is known, and the size is only known
+    /// once a tile has decoded - until then a wrong guess would move the whole list, and a tile
+    /// wrongly called empty is a hole in the archive, so the caller is told "maybe".
+    pub fn covers(&mut self, bounds: (f64, f64, f64, f64), out_size: u32, target: f64) -> bool {
+        if !self.size_known {
+            return true;
+        }
+        let Some((z, x0, x1, y0, y1)) = self.tiles_under(bounds, out_size, target) else {
+            return false;
+        };
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                if self.grid(z, x, y).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Fetch tiles into the disk cache, many at once, so that the render finds them there.
+    ///
+    /// The render asks for one tile at a time and waits for each, which against a public service
+    /// is a few hundred milliseconds apiece; this is the same set of tiles asked for together.
+    /// Anything already cached - a tile or the marker for one the source lacks - is left alone,
+    /// and a PMTiles archive's own directory settles which tiles exist before any request is made.
+    /// Nothing is decoded here and nothing is returned: a failure is counted and left for the
+    /// render's own retry to meet.
+    pub fn prefetch(&mut self, keys: &[(u8, u32, u32)]) {
+        let Some(cache) = &self.reader.cache else { return };
+        let Backing::Remote { base, fetcher } = &self.reader.backing else { return };
+        let mut requests = Vec::new();
+        let mut asked = Vec::new();
+        let mut trouble: Option<String> = None;
+        for &(z, x, y) in keys {
+            if cache.absent_path(z, x, y).exists()
+                || cache.tile_path(z, x, y, &self.extension).exists()
+            {
+                continue;
+            }
+            match &mut self.layout {
+                Layout::Xyz => {
+                    let url = base
+                        .replace("{z}", &z.to_string())
+                        .replace("{x}", &x.to_string())
+                        .replace("{y}", &y.to_string());
+                    requests.push((url, None));
+                    asked.push((z, x, y));
+                }
+                Layout::PmTiles(archive) => match archive.locate(&self.reader, z, x, y) {
+                    Ok(Some((offset, length))) if length > 0 => {
+                        requests.push((base.clone(), Some((offset, offset + length - 1))));
+                        asked.push((z, x, y));
+                    }
+                    // the directory says it is not there: no request, just the marker
+                    Ok(_) => cache.store(&cache.absent_path(z, x, y), &[]),
+                    Err(e) => trouble = Some(format!("z{z}/{x}/{y}: {e}")),
+                },
+            }
+        }
+        let answers = fetcher.get_many(requests, self.concurrency);
+        for ((z, x, y), answer) in asked.into_iter().zip(answers) {
+            match answer {
+                Ok(Some(bytes)) => cache.store(&cache.tile_path(z, x, y, &self.extension), &bytes),
+                Ok(None) => cache.store(&cache.absent_path(z, x, y), &[]),
+                Err(e) => trouble = Some(format!("z{z}/{x}/{y}: {e}")),
+            }
+        }
+        if trouble.is_some() {
+            self.last_error = trouble;
+        }
+    }
+
     /// What this source did, for the end of a render.
     ///
     /// Counted rather than formatted, because a parallel build has one of these per worker and
     /// eighteen lines of half a story is worse than one line of the whole one.
     pub fn stats(&self) -> TileStats {
-        let (requests, bytes, failures) =
-            self.reader.fetcher().map(|f| f.stats()).unwrap_or((0, 0, 0));
+        let c = &self.counters;
         TileStats {
-            decoded: self.decoded,
-            from_cache: self.from_disk,
-            requests,
-            bytes,
-            failures,
-            unreadable: self.errors,
+            decoded: Counters::get(&c.decoded),
+            from_cache: Counters::get(&c.from_disk),
+            requests: Counters::get(&c.requests),
+            bytes: Counters::get(&c.bytes),
+            failures: Counters::get(&c.failures),
+            not_found: Counters::get(&c.not_found),
+            retries: Counters::get(&c.retries),
+            fetch_ms: Counters::get(&c.fetch_ms),
+            unreadable: Counters::get(&c.unreadable),
             last_error: self.last_error.clone(),
         }
     }
 
+    /// The live counters, readable without locking the source they belong to.
+    pub fn counters(&self) -> Arc<Counters> {
+        self.counters.clone()
+    }
+
     /// Tiles this source could not read. Non-zero means the archive has holes it should not.
     pub fn errors(&self) -> u64 {
-        self.errors
+        Counters::get(&self.counters.unreadable)
     }
 }
 
@@ -653,6 +861,7 @@ mod tests {
                 minzoom: Some(0),
                 maxzoom: Some(5),
                 cache_dir: Some(dir.to_path_buf()),
+                concurrency: DEFAULT_CONCURRENCY,
             },
         )
         .unwrap()
@@ -709,6 +918,123 @@ mod tests {
         assert_eq!(tiles.zoom_for(0.0, base / 8.0), 3);
         // finer than the tileset goes is capped rather than asked for
         assert_eq!(tiles.zoom_for(0.0, 0.01), 5);
+    }
+
+    fn wide(dir: &Path) -> TerrainTiles {
+        TerrainTiles::xyz(
+            "https://invalid.invalid/{z}/{x}/{y}.webp",
+            TilesConfig {
+                tile_size: 512,
+                minzoom: Some(0),
+                maxzoom: Some(14),
+                cache_dir: Some(dir.to_path_buf()),
+                ..TilesConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The regression behind a build that asked for three times the tiles it needed: pixels either
+    /// side of a tile's centre latitude must choose the same zoom.
+    #[test]
+    fn every_pixel_of_a_tile_reads_the_same_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiles = wide(dir.path());
+        for (z, y) in [(5u8, 10u32), (8, 91), (12, 1481), (13, 2963), (13, 4000)] {
+            let query = crate::terrain::render::tile_query(z, 0, y, 512);
+            tiles.set_reference_latitude(Some(query.centre_lat));
+            let (_, south, _, north) = query.bounds;
+            let zooms: std::collections::BTreeSet<u8> = (0..=16)
+                .map(|i| south + (north - south) * i as f64 / 16.0)
+                .map(|lat| tiles.zoom_for(lat, query.target_m_per_px))
+                .collect();
+            assert_eq!(zooms.len(), 1, "z{z} row {y} read zooms {zooms:?}");
+            // 512-pixel output on a 512-pixel source is the same zoom
+            assert_eq!(*zooms.iter().next().unwrap(), z);
+        }
+    }
+
+    /// 256-pixel output reads the zoom below: one source tile spans four output tiles' worth of
+    /// pixels per zoom, so a z13 output tile is half of a z12 source tile.
+    #[test]
+    fn a_256_pixel_output_reads_one_zoom_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiles = wide(dir.path());
+        let query = crate::terrain::render::tile_query(13, 4300, 2950, 256);
+        tiles.set_reference_latitude(Some(query.centre_lat));
+        let (z, x0, x1, y0, y1) =
+            tiles.tiles_under(query.bounds, 256, query.target_m_per_px).unwrap();
+        assert_eq!(z, 12);
+        // half a z12 tile plus bilinear texels that stay inside it: exactly one tile
+        assert_eq!((x0, x1, y0, y1), (2150, 2150, 1475, 1475));
+    }
+
+    /// An output tile of the same zoom as its source reads its own tile, and only reaches into a
+    /// neighbour by the texel bilinear filtering takes beyond its edge.
+    #[test]
+    fn tiles_under_follows_what_sample_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiles = wide(dir.path());
+        let query = crate::terrain::render::tile_query(10, 500, 350, 512);
+        tiles.set_reference_latitude(Some(query.centre_lat));
+        let (z, x0, x1, y0, y1) =
+            tiles.tiles_under(query.bounds, 512, query.target_m_per_px).unwrap();
+        assert_eq!(z, 10);
+        assert!(x0 >= 499 && x1 <= 501 && y0 >= 349 && y1 <= 351, "{x0}..{x1} {y0}..{y1}");
+        assert!(x0 <= 500 && x1 >= 500 && y0 <= 350 && y1 >= 350);
+    }
+
+    /// An output tile whose source tiles are all marked absent is empty; one with a tile is not.
+    #[test]
+    fn covers_is_decided_from_the_tiles_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (z, x, y) = (12u8, 2150u32, 1475u32);
+        let query = crate::terrain::render::tile_query(13, 4300, 2950, 256);
+
+        // absent: skipped, with no request
+        let marker = dir.path().join(format!("tiles/{z}/{x}/{y}.absent"));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, []).unwrap();
+        let mut tiles = wide(dir.path());
+        tiles.size_known = true;
+        tiles.set_reference_latitude(Some(query.centre_lat));
+        assert!(!tiles.covers(query.bounds, 256, query.target_m_per_px));
+        assert_eq!(tiles.reader.fetcher().unwrap().stats().0, 0);
+
+        // present: renders
+        std::fs::remove_file(&marker).unwrap();
+        let png = dir.path().join(format!("tiles/{z}/{x}/{y}.webp"));
+        let rgb = image::RgbImage::from_pixel(512, 512, image::Rgb([128, 10, 0]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(rgb).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        // the decoder sniffs the format, so the extension does not matter to it
+        std::fs::write(&png, out.into_inner()).unwrap();
+        let mut tiles = wide(dir.path());
+        tiles.size_known = true;
+        tiles.set_reference_latitude(Some(query.centre_lat));
+        assert!(tiles.covers(query.bounds, 256, query.target_m_per_px));
+    }
+
+    /// Before any tile has decoded the size is a guess, and a wrong guess must not skip a tile.
+    #[test]
+    fn covers_says_maybe_until_the_size_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiles = wide(dir.path());
+        let query = crate::terrain::render::tile_query(13, 4300, 2950, 256);
+        assert!(tiles.covers(query.bounds, 256, query.target_m_per_px));
+    }
+
+    /// A local archive is its own cache.
+    #[test]
+    fn a_local_archive_is_never_copied_into_a_cache() {
+        // any readable file will do; the point is that the reader drops the cache it was handed
+        let reader = Reader::open(
+            &Location::Local(std::env::current_exe().unwrap()),
+            Some(DiskCache::new(PathBuf::from("/tmp/never"))),
+            Arc::new(Counters::default()),
+        )
+        .unwrap();
+        assert!(reader.cache.is_none());
     }
 
     #[test]

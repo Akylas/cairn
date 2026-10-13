@@ -6,7 +6,6 @@
   import { invoke, isTauri } from "./api.js";
   import { onMount } from "svelte";
   import { buildConfig } from "./buildconfig.svelte.js";
-  import { commandFor, scriptFor } from "./cli.js";
 
   let ref = $state(null);
   let error = $state("");
@@ -27,15 +26,8 @@
   }
 
   let current = $derived(ref?.commands?.find((c) => c.name === picked));
-  let script = $derived(
-    scriptFor(
-      buildConfig.steps,
-      buildConfig.area,
-      buildConfig.values,
-      buildConfig.defs,
-      buildConfig.extra,
-    ),
-  );
+  // built by the app from the values it will run with, not worked out again here
+  let script = $derived(buildConfig.lines.map((l) => l.line).join("\n"));
 </script>
 
 {#if error}<p class="warn">{error}</p>{/if}
@@ -68,24 +60,21 @@
   <h4>This build, as a command</h4>
   <div class="block">
     <p class="lede">
-      What the Build tab is set to right now, with the options you have changed and nothing else.
-      Unset options emit no flag, so the command is as sparse as the form.
+      What the Build tab is set to right now, as the app itself would run it: the options you have
+      changed, plus any paths the app is configured with that the command line could not guess.
     </p>
     <pre class="script">{script}</pre>
     <button class="ghost" onclick={() => copy(script)}>
       {copied === script ? "copied" : "Copy all"}
     </button>
     <div class="lines">
-      {#each buildConfig.steps as step}
-        {@const line = commandFor(step, buildConfig.area, buildConfig.values[step] ?? {}, buildConfig.defs[step] ?? [], buildConfig.extra[step])}
-        {#if line}
-          <div class="asline">
-            <code>{line}</code>
-            <button class="ghost tiny" onclick={() => copy(line)}>
-              {copied === line ? "copied" : "copy"}
-            </button>
-          </div>
-        {/if}
+      {#each buildConfig.lines as { line }}
+        <div class="asline">
+          <code>{line}</code>
+          <button class="ghost tiny" onclick={() => copy(line)}>
+            {copied === line ? "copied" : "copy"}
+          </button>
+        </div>
       {/each}
     </div>
   </div>
