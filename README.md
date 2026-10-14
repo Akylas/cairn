@@ -77,8 +77,9 @@ cairn basemap  --area $AREA          # vector basemap
 cairn routes   --area $AREA          # route relations
 cairn elevation --area $AREA         # .hgt tiles
 cairn terrain  --area $AREA          # terrain-RGB
+cairn valhalla-admins --area $AREA   # country boundaries for the graph (optional, once)
 cairn valhalla-tiles --area $AREA    # routing graph
-cairn package  --area $AREA          # Valhalla package
+cairn valhalla-package --area $AREA  # Valhalla package
 ```
 
 Every step clips to the area's own boundary, downloading the `.poly` from Geofabrik the first time it needs

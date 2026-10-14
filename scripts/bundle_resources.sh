@@ -117,38 +117,41 @@ else
   echo "  WARNING: no valhalla.json; routing steps will have no config to start from" >&2
 fi
 
-# --- valhalla_build_tiles --------------------------------------------------------------------
-# The only external tool left: the graph builder. `valhalla_build_elevation` is not here on
-# purpose - it is a Python script, and downloading .hgt tiles is done natively instead, so the
-# app needs no interpreter.
+# --- the Valhalla tools ----------------------------------------------------------------------
+# The external tools left: the graph builder and the boundary database builder. `valhalla_build_elevation`
+# is not here on purpose - it is a Python script, and downloading .hgt tiles is done natively
+# instead, so the app needs no interpreter. `valhalla_build_timezones` is a shell script that needs
+# spatialite, and is not here for the same reason.
 #
-# The binary links ~95 Homebrew dylibs, so copying it alone would produce something that runs
-# only on a machine with the same Homebrew installation. It gets the same treatment as the app:
-# its dependencies are collected into Frameworks and its load commands rewritten. From
-# Resources/valhalla/ that is one level up, hence the different prefix.
+# Each binary links ~95 Homebrew dylibs, so copying it alone would produce something that runs
+# only on a machine with the same Homebrew installation. They get the same treatment as the app:
+# dependencies are collected into Frameworks and load commands rewritten. From Resources/valhalla/
+# that is one level up, hence the different prefix.
 mkdir -p "$resources/valhalla"
-if [ -x "$repo/valhalla/build/valhalla_build_tiles" ]; then
-  cp "$repo/valhalla/build/valhalla_build_tiles" "$resources/valhalla/valhalla_build_tiles"
-  if [ "$os" = macos ]; then
-    # Tauri's resource map is rooted at Contents/Resources, so `frameworks/ -> Frameworks/`
-    # lands at Contents/Resources/Frameworks. From Contents/Resources/resources/valhalla that is
-    # two levels up.
-    "$repo/scripts/bundle_macos_dylibs.sh" \
-      "$resources/valhalla/valhalla_build_tiles" \
-      "$frameworks" \
-      "@executable_path/../../Frameworks"
+for tool in valhalla_build_tiles valhalla_build_admins; do
+  if [ -x "$repo/valhalla/build/$tool" ]; then
+    cp "$repo/valhalla/build/$tool" "$resources/valhalla/$tool"
+    if [ "$os" = macos ]; then
+      # Tauri's resource map is rooted at Contents/Resources, so `frameworks/ -> Frameworks/`
+      # lands at Contents/Resources/Frameworks. From Contents/Resources/resources/valhalla that is
+      # two levels up.
+      "$repo/scripts/bundle_macos_dylibs.sh" \
+        "$resources/valhalla/$tool" \
+        "$frameworks" \
+        "@executable_path/../../Frameworks"
+    else
+      # /usr/lib/<product>/resources/valhalla -> /usr/lib/<product>/Frameworks
+      "$repo/scripts/bundle_linux_libs.sh" \
+        "$resources/valhalla/$tool" \
+        "$frameworks" \
+        '$ORIGIN/../../Frameworks' >/dev/null
+    fi
+    say "$tool"
   else
-    # /usr/lib/<product>/resources/valhalla -> /usr/lib/<product>/Frameworks
-    "$repo/scripts/bundle_linux_libs.sh" \
-      "$resources/valhalla/valhalla_build_tiles" \
-      "$frameworks" \
-      '$ORIGIN/../../Frameworks' >/dev/null
+    echo "  note: $tool not built; the packaged app will look for it on PATH and" >&2
+    echo "        say so in Docs -> Where things live if it is not there either" >&2
   fi
-  say "valhalla_build_tiles"
-else
-  echo "  note: valhalla_build_tiles not built; the packaged app will look for it on PATH and" >&2
-  echo "        say so in Docs -> Where things live if it is not there either" >&2
-fi
+done
 
 # --- the libraries the app itself needs ------------------------------------------------------
 # The app links Valhalla, and Valhalla's dependencies are not something a user's machine can be

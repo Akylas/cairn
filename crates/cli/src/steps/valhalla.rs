@@ -1,10 +1,11 @@
-//! `cairn package` / `unpack` / `route` - the Valhalla steps.
+//! `cairn valhalla-package` / `unpack` / `route` - the Valhalla steps.
 
 use anyhow::{anyhow, Result};
 use cairn_core::settings::Settings;
 use cairn_core::steps::{state, StepId};
 use cairn_core::valhalla::package::{self, Compression, PackageOptions};
 use cairn_core::valhalla::routing;
+use cairn_core::valhalla::select::{self, Selection};
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
@@ -17,7 +18,8 @@ pub struct PackageArgs {
     /// Valhalla tile directory. Defaults to <repo>/valhalla_tiles.
     #[arg(long)]
     pub tiles: Option<PathBuf>,
-    /// Osmosis .poly to select tiles from. This is the usual way to build a new package.
+    /// Osmosis .poly to select tiles from. Without this, --tilemask or --like, an existing
+    /// package is reused, and failing that the area's own boundary is used.
     #[arg(long)]
     pub poly: Option<PathBuf>,
     /// Hierarchy levels to include. Valhalla has three; all of them by default.
@@ -72,64 +74,7 @@ pub struct RouteArgs {
     pub json: bool,
 }
 
-/// Work out which graph tiles to pack.
-///
-/// In order of directness: the shape itself, a tilemask string, an existing package. The shape
-/// is the one that can describe an area nothing has covered yet, which is what the Python script
-/// was needed for.
-fn tiles_for(
-    args: &PackageArgs,
-    output: &std::path::Path,
-) -> Result<Vec<cairn_core::valhalla::GraphTile>> {
-    use cairn_core::poly::Polygon;
-    use cairn_core::valhalla::{tilemask, tiles_covering, GraphTile, BOUNDS, TILE_SIZES};
-
-    if let Some(poly) = &args.poly {
-        let shape = Polygon::parse(poly)?;
-        return Ok(tiles_covering(&shape, &args.levels));
-    }
-    if let Some(mask) = &args.tilemask {
-        // the mask is a web-mercator quadtree; every graph tile a mercator tile overlaps counts
-        let mut tiles: Vec<GraphTile> = Vec::new();
-        for quad in tilemask::tiles(mask, args.polymaxzoom)? {
-            let (west, south, east, north) = mercator_bounds(quad);
-            for level in &args.levels {
-                let size = TILE_SIZES[(*level).min(2) as usize];
-                let x0 = ((west - BOUNDS.0) / size).floor() as u32;
-                let x1 = ((east - BOUNDS.0) / size).ceil() as u32;
-                let y0 = ((south - BOUNDS.1) / size).floor() as u32;
-                let y1 = ((north - BOUNDS.1) / size).ceil() as u32;
-                for y in y0..y1.max(y0 + 1) {
-                    for x in x0..x1.max(x0 + 1) {
-                        tiles.push(GraphTile::new(x, y, *level));
-                    }
-                }
-            }
-        }
-        tiles.sort();
-        tiles.dedup();
-        return Ok(tiles);
-    }
-    let reference = args.like.clone().unwrap_or_else(|| output.to_path_buf());
-    package::tiles_in(&reference).map_err(|_| {
-        anyhow!(
-            "no tile list: pass --poly <area.poly>, --tilemask <mask>, or --like <existing.vtiles>"
-        )
-    })
-}
-
-/// Lon/lat box of a web-mercator tile.
-fn mercator_bounds(tile: cairn_core::valhalla::tilemask::QuadTile) -> (f64, f64, f64, f64) {
-    let n = 2f64.powi(tile.z as i32);
-    let lon = |x: f64| x / n * 360.0 - 180.0;
-    let lat = |y: f64| {
-        let t = std::f64::consts::PI * (1.0 - 2.0 * y / n);
-        t.sinh().atan().to_degrees()
-    };
-    (lon(tile.x as f64), lat(tile.y as f64 + 1.0), lon(tile.x as f64 + 1.0), lat(tile.y as f64))
-}
-
-pub fn package(settings: &Settings, args: PackageArgs) -> Result<()> {
+pub async fn package(settings: &Settings, args: PackageArgs) -> Result<()> {
     let area_dir = settings.area_dir(&args.area);
     let recorded: std::collections::BTreeMap<String, serde_json::Value> =
         [("compression".to_string(), args.compression.clone().into())].into_iter().collect();
@@ -143,7 +88,28 @@ pub fn package(settings: &Settings, args: PackageArgs) -> Result<()> {
         return Ok(());
     }
 
-    let tiles = tiles_for(&args, &output)?;
+    let selection = Selection {
+        poly: args.poly.clone(),
+        tilemask: args.tilemask.clone(),
+        polymaxzoom: args.polymaxzoom,
+        levels: args.levels.clone(),
+        like: args.like.clone(),
+    };
+    // nothing named and nothing to copy from: the area's own boundary, fetched when it is not
+    // already beside the extract - the same default the app uses
+    let boundary = if selection.needs_area_poly(&output) {
+        let path =
+            cairn_core::steps::download::ensure_poly(&settings.data_dir, &args.area, |_, _| {})
+                .await
+                .map_err(|e| {
+                    anyhow!("no tile list given, and the area boundary is not available: {e}")
+                })?;
+        println!("tile list from the boundary {}", path.display());
+        Some(path)
+    } else {
+        None
+    };
+    let tiles = select::tiles_for(&selection, &output, boundary.as_deref())?;
     if args.dry_run {
         println!("{} tiles from {}", tiles.len(), tile_dir.display());
         for tile in &tiles {

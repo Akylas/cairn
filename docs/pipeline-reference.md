@@ -264,6 +264,27 @@ either with an explicit bbox (`-b '{w},{s},{e},{n}'`) or, once a graph already e
 valhalla_build_elevation -v -d -t -c valhalla.json
 ```
 
+### Build the boundaries (optional, once)
+
+The graph builder looks every node up in a database of country and state boundaries, for which side of
+the road traffic drives on, the access defaults a country applies to ways nobody tagged, and the names
+in instructions. Without one it still builds - treating everywhere alike, and warning once per tile.
+Measured on rhone-alpes it adds 0.2% to a gzipped package, and nothing to the build time.
+
+```shell
+valhalla_build_admins -c valhalla.json data/sources/${AREA//-/_}.osm.pbf     # or: cairn valhalla-admins --area $AREA
+```
+
+It is built once, to the path `valhalla.json` names under `mjolnir.admin` (`valhalla_admin/admins.sqlite`),
+and every graph built afterwards uses it - a graph built before it exists does not, and has to be rebuilt.
+It needs an extract holding whole countries: run over a continent (Europe: 50 countries, 154 MB, four
+minutes) it works; run over a region it finds the boundaries it cannot close, writes an empty database,
+and the step fails saying so rather than leaving it there. Use the same parent extract as the graph.
+
+Time zones are a second database, for time-dependent routing. `valhalla_build_timezones` makes it, and
+needs `spatialite`, `curl` and `unzip`, which the app does not ship; it changed nothing in the tiles it
+was tried on.
+
 ### Build the tiles
 
 first build valhalla tiles if you didnt already. In my case i build valhalla tiles for the whole europe to ensure i have all tiles to calculate routes

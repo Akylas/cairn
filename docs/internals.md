@@ -428,7 +428,7 @@ cairn basemap --area rhone-alpes --preset measured -o simplify_tolerance=0.6
 cairn routes  --area rhone-alpes --output /tmp/routes.mbtiles
 cairn terrain --area rhone-alpes --poly-shape rhone-alpes.poly --maxzoom 13 -j 8
 cairn hillshade --area rhone-alpes --poly-shape rhone-alpes.poly
-cairn package --area rhone-alpes --poly rhone-alpes.poly --compression zopfli
+cairn valhalla-package --area rhone-alpes --poly rhone-alpes.poly --compression zopfli
 cairn route   --tiles .../rhone-alpes.vtiles --point 5.72,45.19 --point 5.92,45.56
 cairn profile --terrain .../rhone-alpes_terrain.mbtiles --point 6.5,45.35 --point 6.9,45.42
 cairn state   --area rhone-alpes                      # what is built, from the files

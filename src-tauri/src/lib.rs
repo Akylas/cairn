@@ -1070,7 +1070,7 @@ async fn resolved_defaults(config: State<'_, Config>) -> Result<ResolvedDefaults
     areas.sort();
     let bin_dirs = settings.valhalla_bin_dirs();
     // only one external tool is left: the elevation tiles are downloaded natively
-    let valhalla_tools = ["valhalla_build_tiles"]
+    let valhalla_tools = ["valhalla_build_tiles", "valhalla_build_admins"]
         .iter()
         .map(|name| {
             let found =
@@ -1289,7 +1289,10 @@ async fn run_steps(
                 })
                 .await;
         }
-        let forced = req.force_all || req.force.contains(&step);
+        // "force all" rebuilds what was asked for. A step that is only in the plan because
+        // something selected needs it is still skipped when its output is already there - a
+        // package must not re-download the OSM extract because the graph depends on it.
+        let forced = (req.force_all && req.steps.contains(&step)) || req.force.contains(&step);
         if !forced {
             let status = build_state::status(&settings, &req.area, step, &values);
             if let build_state::StepStatus::Built { outputs, .. } = &status {
@@ -1359,6 +1362,9 @@ async fn run_steps(
             StepId::ElevationTiles => {
                 run_elevation(&settings, &req.area, tx.clone(), &cancel).await
             }
+            StepId::ValhallaAdmins => {
+                run_valhalla_admins(&settings, &req.area, tx.clone(), &cancel).await
+            }
             StepId::ValhallaTiles => {
                 run_valhalla_tool(
                     &settings,
@@ -1387,7 +1393,7 @@ async fn run_steps(
                 .await
             }
             StepId::ValhallaPackage => {
-                run_valhalla_package(&settings, &req.area, tx.clone(), &cancel).await
+                run_valhalla_package(&settings, &req.area, &values, tx.clone(), &cancel).await
             }
             StepId::Basemap | StepId::Routes => {
                 let defs = options::for_step(step);
@@ -1810,6 +1816,86 @@ async fn run_valhalla_tool(
     external::run(job, tx, cancel.receiver()).await.map_err(|e| e.to_string())
 }
 
+/// Build the boundary database the graph builder looks nodes up in.
+///
+/// The tool says it is finished before the database has been looked at, so its own end-of-run
+/// event is held back and this step reports the outcome of the check - an extract of a region
+/// produces a database with no boundaries in it, and that is a failure, not a success.
+async fn run_valhalla_admins(
+    settings: &Settings,
+    area: &str,
+    tx: mpsc::Sender<StepEvent>,
+    cancel: &Cancel,
+) -> Result<bool, String> {
+    use cairn_core::steps::{admins, external};
+
+    let step = StepId::ValhallaAdmins;
+    let bin_dirs = settings.valhalla_bin_dirs();
+    let program =
+        external::find_tool(bin_dirs.iter().map(|p| p.as_path()), "valhalla_build_admins")
+            .ok_or_else(|| {
+                format!(
+                    "valhalla_build_admins not found - looked in {}, and on PATH. Set the \
+                     binary directory in Settings.",
+                    bin_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                )
+            })?;
+    let prepared =
+        admins::prepare(settings, area, program, None, None).map_err(|e| format!("{e:#}"))?;
+    let job = external::ToolJob {
+        step,
+        area: prepared.job.area.clone(),
+        program: prepared.job.program.clone(),
+        args: prepared.job.args.clone(),
+        working_dir: prepared.job.working_dir.clone(),
+        parse: prepared.job.parse,
+    };
+
+    let (inner, mut events) = mpsc::channel::<StepEvent>(512);
+    let relay = {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if !matches!(event, StepEvent::Finished { .. }) {
+                    let _ = tx.send(event).await;
+                }
+            }
+        })
+    };
+    let ran = external::run(job, inner, cancel.receiver()).await;
+    let _ = relay.await;
+    let finished = |ok: bool| StepEvent::Finished { step, ok, elapsed: None, outputs: vec![] };
+
+    match ran {
+        Ok(true) => match admins::finish(&prepared) {
+            Ok(report) => {
+                let _ = tx
+                    .send(StepEvent::Log {
+                        step,
+                        line: format!("{report}: {}", prepared.output.display()),
+                    })
+                    .await;
+                let _ = tx.send(finished(true)).await;
+                Ok(true)
+            }
+            Err(e) => {
+                let _ = tx.send(StepEvent::Log { step, line: format!("ERROR: {e}") }).await;
+                let _ = tx.send(finished(false)).await;
+                Ok(false)
+            }
+        },
+        Ok(false) => {
+            admins::discard(&prepared);
+            let _ = tx.send(finished(false)).await;
+            Ok(false)
+        }
+        Err(e) => {
+            admins::discard(&prepared);
+            Err(e.to_string())
+        }
+    }
+}
+
 /// Build the terrain pyramid from `.hgt` sources.
 ///
 /// Reads only SRTM `.hgt`, which needs no projection library. The GeoTIFF raster sources in
@@ -2022,28 +2108,72 @@ async fn run_terrain(
 async fn run_valhalla_package(
     settings: &Settings,
     area: &str,
+    values: &BTreeMap<String, serde_json::Value>,
     tx: mpsc::Sender<StepEvent>,
     cancel: &Cancel,
 ) -> Result<bool, String> {
     use cairn_core::valhalla::package::{self, Compression, PackageOptions};
+    use cairn_core::valhalla::select::{self, Selection};
 
     let step = StepId::ValhallaPackage;
     let _ = tx.send(StepEvent::Started { step, area: area.to_string() }).await;
+    let log = |line: String| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(StepEvent::Log { step, line }).await;
+        }
+    };
 
     let tile_dir = settings.repo_root.join("valhalla_tiles");
+    if !tile_dir.is_dir() {
+        return Err(format!(
+            "{} does not exist - build the Valhalla tiles first",
+            tile_dir.display()
+        ));
+    }
     let output = settings.area_dir(area).join(format!("{area}.vtiles"));
-    // reuse the tile list of the previous package when there is one; otherwise there is no
-    // tilemask to work from and the step cannot pick tiles on its own yet
-    let tiles = package::tiles_in(&output).map_err(|_| {
-        "no existing package to take a tile list from; build one with the script first"
-    })?;
-
-    let opts = PackageOptions {
-        package_id: area.to_string(),
-        tile_dir,
-        output,
-        compression: Compression::Zopfli,
+    let text = |key: &str| {
+        values.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty())
     };
+    let compression = match text("compression").unwrap_or("zopfli") {
+        "zopfli" => Compression::Zopfli,
+        "zlib" => Compression::Zlib,
+        other => return Err(format!("unknown compression `{other}`")),
+    };
+    let selection = Selection {
+        poly: text("poly").map(std::path::PathBuf::from),
+        levels: match text("levels") {
+            Some(raw) => select::parse_levels(raw).map_err(|e| e.to_string())?,
+            None => Selection::default().levels,
+        },
+        ..Selection::default()
+    };
+
+    // With no shape named and no package to copy the list from, the area's own boundary is the
+    // list - fetched if it is not already beside the extract. It used to be an error here,
+    // telling someone to go and run a script.
+    let boundary = if selection.needs_area_poly(&output) {
+        let path = cairn_core::steps::download::ensure_poly(&settings.data_dir, area, |_, _| {})
+            .await
+            .map_err(|e| {
+                format!("no tile list given, and the area boundary is not available: {e}")
+            })?;
+        log(format!("tile list from the area boundary {}", path.display())).await;
+        Some(path)
+    } else {
+        None
+    };
+    let tiles =
+        select::tiles_for(&selection, &output, boundary.as_deref()).map_err(|e| e.to_string())?;
+    log(format!(
+        "packing {} graph tiles from {} ({})",
+        tiles.len(),
+        tile_dir.display(),
+        text("compression").unwrap_or("zopfli")
+    ))
+    .await;
+
+    let opts = PackageOptions { package_id: area.to_string(), tile_dir, output, compression };
     let progress = tx.clone();
     let stop = cancel.clone();
     let report = tokio::task::spawn_blocking(move || {

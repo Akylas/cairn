@@ -33,7 +33,10 @@ fn style(step: StepId) -> Style {
     match step {
         StepId::Basemap | StepId::Routes => Style::Overrides,
         StepId::TerrainRgb | StepId::ValhallaPackage | StepId::Bathymap => Style::Flags,
-        StepId::DownloadOsm | StepId::ElevationTiles | StepId::ValhallaTiles => Style::Area,
+        StepId::DownloadOsm
+        | StepId::ElevationTiles
+        | StepId::ValhallaAdmins
+        | StepId::ValhallaTiles => Style::Area,
     }
 }
 

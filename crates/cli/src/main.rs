@@ -52,10 +52,13 @@ enum Command {
     Bathymap(steps::bathymap::Args),
     /// Build terrain-RGB tiles from the sources in sources.json.
     Terrain(steps::terrain::Args),
+    /// Build the country and state boundaries the Valhalla graph builder looks nodes up in.
+    ValhallaAdmins(steps::tools::ToolArgs),
     /// Build the Valhalla routing graph from the OSM extract.
     ValhallaTiles(steps::tools::ToolArgs),
     /// Pack a Valhalla tile directory into a .vtiles routing package.
-    Package(steps::valhalla::PackageArgs),
+    #[command(alias = "package")]
+    ValhallaPackage(steps::valhalla::PackageArgs),
     /// Expand a .vtiles package back into a tile directory.
     Unpack(steps::valhalla::UnpackArgs),
     /// Route between points using a package or tile directory.
@@ -79,12 +82,13 @@ async fn main() -> Result<()> {
         Command::Catalog(args) => steps::catalog::run(&settings, args),
         Command::Download(args) => steps::tools::download(&settings, args).await,
         Command::Elevation(args) => steps::tools::elevation(&settings, args).await,
+        Command::ValhallaAdmins(args) => steps::tools::valhalla_admins(&settings, args).await,
         Command::ValhallaTiles(args) => steps::tools::valhalla_tiles(&settings, args).await,
         Command::Basemap(args) => steps::planetiler::run(&settings, args, false).await,
         Command::Routes(args) => steps::planetiler::run(&settings, args, true).await,
         Command::Bathymap(args) => steps::bathymap::run(&settings, args).await,
         Command::Terrain(args) => steps::terrain::run(&settings, args).await,
-        Command::Package(args) => steps::valhalla::package(&settings, args),
+        Command::ValhallaPackage(args) => steps::valhalla::package(&settings, args).await,
         Command::Unpack(args) => steps::valhalla::unpack(args),
         Command::Route(args) => steps::valhalla::route(&settings, args),
         Command::Profile(args) => steps::profile::run(args),

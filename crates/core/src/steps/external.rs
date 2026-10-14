@@ -177,7 +177,7 @@ async fn emit(tx: &mpsc::Sender<StepEvent>, step: StepId, parse: LineParser, lin
         event @ StepEvent::Phase { .. } => {
             // A tool with no percentage of its own at least has a place in its sequence, and a
             // bar that sits at 0% for an hour reads as a hung process.
-            let reading = match (&event, stage_percent(&line)) {
+            let reading = match (&event, stage_percent(step, &line)) {
                 (StepEvent::Phase { name, .. }, Some(percent)) => {
                     Some(StepEvent::Progress { step, label: name.clone(), percent })
                 }
@@ -207,7 +207,7 @@ async fn emit(tx: &mpsc::Sender<StepEvent>, step: StepId, parse: LineParser, lin
 /// `[INFO] Building 2 tiles with 18 threads...`; anything else is ordinary chatter.
 pub fn valhalla_line(step: StepId, line: &str) -> StepEvent {
     let clean = crate::progress::strip_ansi(line);
-    match phase_of(&clean) {
+    match phase_of(step, &clean) {
         Some(name) => StepEvent::Phase { step, name },
         None => StepEvent::Log { step, line: clean },
     }
@@ -237,20 +237,38 @@ const STAGES: [(&str, &str, u8); 14] = [
     ("Binning inter-tile", "Binning edges", 97),
 ];
 
+/// The same for `valhalla_build_admins`, which prints different banners - some of them (`Parsing
+/// ways...`) the same words as the graph builder's, which is why the table follows the step.
+const ADMIN_STAGES: [(&str, &str, u8); 6] = [
+    ("Parsing relations", "Finding boundaries", 3),
+    ("admin polygons comprised", "Found boundaries", 20),
+    ("Parsing ways...", "Parsing ways", 25),
+    ("Parsing nodes...", "Parsing nodes", 40),
+    ("Start populating admin tables", "Building the database", 85),
+    ("Writing database to disk", "Writing the database", 97),
+];
+
+fn stages_of(step: StepId) -> &'static [(&'static str, &'static str, u8)] {
+    match step {
+        StepId::ValhallaAdmins => &ADMIN_STAGES,
+        _ => &STAGES,
+    }
+}
+
 fn info_of(line: &str) -> Option<&str> {
     Some(line.split_once("[INFO] ")?.1)
 }
 
 /// Where in the build this line says it is, for a tool that does not report a percentage.
-pub fn stage_percent(line: &str) -> Option<u8> {
+pub fn stage_percent(step: StepId, line: &str) -> Option<u8> {
     let rest = info_of(line)?;
-    STAGES.iter().find(|(needle, ..)| rest.contains(needle)).map(|(.., percent)| *percent)
+    stages_of(step).iter().find(|(needle, ..)| rest.contains(needle)).map(|(.., percent)| *percent)
 }
 
 /// Recognise the stage banners Valhalla prints, so the UI can show where a long build is.
-fn phase_of(line: &str) -> Option<String> {
+fn phase_of(step: StepId, line: &str) -> Option<String> {
     let rest = info_of(line)?;
-    if let Some((_, name, _)) = STAGES.iter().find(|(needle, ..)| rest.contains(needle)) {
+    if let Some((_, name, _)) = stages_of(step).iter().find(|(needle, ..)| rest.contains(needle)) {
         return Some((*name).to_string());
     }
     const BANNERS: [&str; 8] = [
@@ -303,11 +321,14 @@ mod tests {
     #[test]
     fn stage_banners_become_phases() {
         assert_eq!(
-            phase_of("2026/08/20 10:00:00.000000 [INFO] Parsing files: data/alps.osm.pbf"),
+            phase_of(
+                StepId::ValhallaTiles,
+                "2026/08/20 10:00:00.000000 [INFO] Parsing files: data/alps.osm.pbf"
+            ),
             Some("Parsing files".to_string())
         );
         assert_eq!(
-            phase_of("[INFO] Building tiles from level 0"),
+            phase_of(StepId::ValhallaTiles, "[INFO] Building tiles from level 0"),
             Some("Building tiles from level 0".to_string())
         );
     }
@@ -316,9 +337,9 @@ mod tests {
     /// display several times a second.
     #[test]
     fn chatter_is_not_a_phase() {
-        assert_eq!(phase_of("[INFO] 1000 nodes processed"), None);
-        assert_eq!(phase_of("[WARN] Building something"), None);
-        assert_eq!(phase_of("no marker at all"), None);
+        assert_eq!(phase_of(StepId::ValhallaTiles, "[INFO] 1000 nodes processed"), None);
+        assert_eq!(phase_of(StepId::ValhallaTiles, "[WARN] Building something"), None);
+        assert_eq!(phase_of(StepId::ValhallaTiles, "no marker at all"), None);
     }
 
     /// The tools colour the level tag, which puts an escape between `[INFO]` and the space the
@@ -339,11 +360,26 @@ mod tests {
 
     #[test]
     fn the_stages_only_move_forward() {
-        let percents: Vec<u8> = STAGES.iter().map(|(.., p)| *p).collect();
-        assert!(percents.windows(2).all(|w| w[0] < w[1]), "{percents:?}");
-        assert_eq!(stage_percent("t [INFO] Building 2 tiles with 18 threads..."), Some(50));
-        assert_eq!(stage_percent("t [INFO] Finished with 6473 graph edges"), None);
-        assert_eq!(stage_percent("t [WARN] Building tiles with problems"), None);
+        for table in [&STAGES[..], &ADMIN_STAGES[..]] {
+            let percents: Vec<u8> = table.iter().map(|(.., p)| *p).collect();
+            assert!(percents.windows(2).all(|w| w[0] < w[1]), "{percents:?}");
+        }
+        let tiles = StepId::ValhallaTiles;
+        assert_eq!(stage_percent(tiles, "t [INFO] Building 2 tiles with 18 threads..."), Some(50));
+        assert_eq!(stage_percent(tiles, "t [INFO] Finished with 6473 graph edges"), None);
+        assert_eq!(stage_percent(tiles, "t [WARN] Building tiles with problems"), None);
+    }
+
+    /// `Parsing ways...` is a banner of both tools, and means a different place in each.
+    #[test]
+    fn the_admin_tool_has_its_own_stages() {
+        let line = "t [INFO] Parsing ways...";
+        assert_eq!(stage_percent(StepId::ValhallaAdmins, line), Some(25));
+        assert_eq!(stage_percent(StepId::ValhallaTiles, line), None);
+        assert_eq!(
+            stage_percent(StepId::ValhallaAdmins, "t [INFO] Writing database to disk."),
+            Some(97)
+        );
     }
 
     #[test]

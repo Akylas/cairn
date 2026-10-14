@@ -349,7 +349,7 @@
       note: "the graph the phone routes on",
       // a navigation arrow
       icon: "M14 2.4 2 7.2l4.8 2 2 4.8L14 2.4Z",
-      steps: ["valhalla_tiles", "valhalla_package"],
+      steps: ["valhalla_admins", "valhalla_tiles", "valhalla_package"],
     },
   ];
 
@@ -850,7 +850,7 @@
   {/each}
 
   <div class="runbar">
-    <label class="forceall" title="ignore what is on disk and rebuild the whole plan">
+    <label class="forceall" title="rebuild the steps you ticked, ignoring what is on disk. Steps added only because they are needed are still skipped when already built">
       <input type="checkbox" bind:checked={forceAll} disabled={running} /> force all
     </label>
     <button onclick={run} disabled={!ready}>

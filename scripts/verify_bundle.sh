@@ -110,16 +110,18 @@ else
   bad "the CLI is not in the bundle"
 fi
 
-if [ -x "$RES/valhalla/valhalla_build_tiles" ]; then
-  resolve_all "valhalla_build_tiles" "$RES/valhalla/valhalla_build_tiles" "$RES/valhalla"
-  runs "valhalla_build_tiles" "$RES/valhalla/valhalla_build_tiles" --help
-  outside="$(DYLD_PRINT_LIBRARIES=1 "$RES/valhalla/valhalla_build_tiles" --help 2>&1 |
-    grep -c "/opt/homebrew\|/usr/local/Cellar" || true)"
-  [ "$outside" = "0" ] && note "valhalla_build_tiles loads nothing from outside" \
-    || bad "valhalla_build_tiles loads $outside libraries from outside the bundle"
-else
-  note "valhalla_build_tiles not bundled - that step will look on PATH"
-fi
+for tool in valhalla_build_tiles valhalla_build_admins; do
+  if [ -x "$RES/valhalla/$tool" ]; then
+    resolve_all "$tool" "$RES/valhalla/$tool" "$RES/valhalla"
+    runs "$tool" "$RES/valhalla/$tool" --help
+    outside="$(DYLD_PRINT_LIBRARIES=1 "$RES/valhalla/$tool" --help 2>&1 |
+      grep -c "/opt/homebrew\|/usr/local/Cellar" || true)"
+    [ "$outside" = "0" ] && note "$tool loads nothing from outside" \
+      || bad "$tool loads $outside libraries from outside the bundle"
+  else
+    note "$tool not bundled - that step will look on PATH"
+  fi
+done
 
 # --- the jar, which is optional ---------------------------------------------------------------
 jar="$(ls -1 "$RES"/*-with-deps.jar 2>/dev/null | head -1 || true)"

@@ -256,8 +256,8 @@ jobs:
             -DENABLE_TESTS=Off \
             -DENABLE_TOOLS=Off \
             ${extra[@]+"${extra[@]}"}
-          # Only what is shipped. `all` builds 26 executables, of which the bundle carries one:
-          # valhalla_build_tiles. Each of the other 25 links the 40 MB archive to produce
+          # Only what is shipped. `all` builds 26 executables, of which the bundle carries two:
+          # valhalla_build_tiles and valhalla_build_admins. Each of the other 24 links the 40 MB archive to produce
           # something that is then thrown away - the library and that one tool take 87s here,
           # against many minutes for the rest.
           #
@@ -265,7 +265,7 @@ jobs:
           # builder. ENABLE_TOOLS=Off above drops valhalla_service and friends, and with services
           # already off it takes the libgeotiff dependency with it.
           cmake --build valhalla/build -j"$(getconf _NPROCESSORS_ONLN)" \
-            --target valhalla valhalla_build_tiles
+            --target valhalla valhalla_build_tiles valhalla_build_admins
           # worth having in the log: it says whether the compiler cache did anything, which is
           # the difference between a rebuild of the delta and a rebuild of everything
           ccache -s 2>/dev/null | head -5 || true

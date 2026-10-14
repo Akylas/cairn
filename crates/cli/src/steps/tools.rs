@@ -221,6 +221,71 @@ pub async fn valhalla_tiles(settings: &Settings, args: ToolArgs) -> Result<()> {
     run_tool(settings, args, job, out).await
 }
 
+/// `valhalla_build_admins` - the country and state boundaries the graph builder looks nodes up in.
+pub async fn valhalla_admins(settings: &Settings, args: ToolArgs) -> Result<()> {
+    use cairn_core::steps::admins;
+
+    let output = admins::output_path(settings);
+    if args.skip_existing && output.is_file() {
+        println!("{} is already there", output.display());
+        return Ok(());
+    }
+    let program = bin(&args, settings, "valhalla_build_admins")?;
+    let prepared = admins::prepare(
+        settings,
+        &args.area,
+        program,
+        args.config.as_deref(),
+        args.input.as_deref(),
+    )?;
+    if args.dry_run {
+        let quoted: Vec<String> =
+            prepared.job.command_line().iter().map(|a| cairn_core::steps::shell_quote(a)).collect();
+        println!("{}", quoted.join(" "));
+        println!("  -> {}", prepared.output.display());
+        return Ok(());
+    }
+
+    let started = std::time::Instant::now();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StepEvent>(512);
+    let job = ToolJob {
+        step: prepared.job.step,
+        area: prepared.job.area.clone(),
+        program: prepared.job.program.clone(),
+        args: prepared.job.args.clone(),
+        working_dir: prepared.job.working_dir.clone(),
+        parse: prepared.job.parse,
+    };
+    let handle = tokio::spawn(external::run(job, tx, tokio::sync::mpsc::channel(1).1));
+    while let Some(event) = rx.recv().await {
+        match event {
+            StepEvent::Phase { name, .. } => println!("[{name}]"),
+            StepEvent::Log { line, .. } => println!("{line}"),
+            _ => {}
+        }
+    }
+    match handle.await? {
+        Ok(true) => {}
+        Ok(false) => {
+            admins::discard(&prepared);
+            return Err(anyhow!("valhalla_build_admins exited non-zero"));
+        }
+        Err(e) => {
+            admins::discard(&prepared);
+            return Err(e);
+        }
+    }
+    let report = admins::finish(&prepared)?;
+    println!("{report}\n  {}", prepared.output.display());
+    let _ = state::mark_done(
+        &settings.area_dir(&args.area),
+        StepId::ValhallaAdmins,
+        Some(super::planetiler::human_elapsed(started.elapsed())),
+        &BTreeMap::new(),
+    );
+    Ok(())
+}
+
 async fn run_tool(
     settings: &Settings,
     args: ToolArgs,

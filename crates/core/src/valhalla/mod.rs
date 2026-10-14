@@ -6,6 +6,7 @@
 
 pub mod package;
 pub mod routing;
+pub mod select;
 pub mod tilemask;
 
 /// Valhalla's three hierarchy levels and the degree size of a tile at each.

@@ -51,7 +51,7 @@ For terrain and routing:
 cairn elevation      --area monaco  # the .hgt tiles the graph and the terrain need
 cairn terrain        --area monaco  # terrain-RGB
 cairn valhalla-tiles --area monaco  # the routing graph
-cairn package        --area monaco  # → output/monaco/monaco.vtiles
+cairn valhalla-package --area monaco  # → output/monaco/monaco.vtiles
 ```
 
 `cairn state --area monaco` shows which outputs exist. A step is *built* when the files it produces are on

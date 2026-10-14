@@ -68,6 +68,7 @@ pub fn outputs_for(
             vec![settings.data_dir.join(format!("{}.osm.pbf", area.replace('-', "_")))]
         }
         StepId::ElevationTiles => vec![settings.elevation_tiles_dir.clone()],
+        StepId::ValhallaAdmins => vec![super::admins::output_path(settings)],
         StepId::ValhallaTiles => vec![settings.repo_root.join("valhalla_tiles")],
     }
 }

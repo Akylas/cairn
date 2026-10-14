@@ -317,8 +317,11 @@ pub fn package_options() -> Vec<OptionDef> {
             "Tile selection shape",
             "Tiles",
             OptionKind::Text,
-            "Path to an osmosis .poly. Every graph tile the shape touches is packed.",
-            "the tile list of the package already there",
+            "Path to an osmosis .poly. Every graph tile the shape touches is packed. Left empty, \
+             the tiles are those of the package already built for this area, and when there is \
+             none, those under the area's own boundary - the .poly beside the OSM extract, \
+             downloaded from Geofabrik if it is missing. Never every tile in the graph.",
+            "the existing package's tiles, else the area's boundary",
         ),
         opt(
             "levels",
@@ -671,7 +674,10 @@ pub fn for_step(step: crate::steps::StepId) -> Vec<OptionDef> {
         StepId::ValhallaPackage => package_options(),
         // the download and the two Valhalla binaries take paths and bounds, which are settings
         // rather than per-run choices
-        StepId::DownloadOsm | StepId::ElevationTiles | StepId::ValhallaTiles => Vec::new(),
+        StepId::DownloadOsm
+        | StepId::ElevationTiles
+        | StepId::ValhallaAdmins
+        | StepId::ValhallaTiles => Vec::new(),
     }
 }
 
@@ -949,7 +955,10 @@ mod tests {
             let defs = for_step(step);
             let expected_empty = matches!(
                 step,
-                StepId::DownloadOsm | StepId::ElevationTiles | StepId::ValhallaTiles
+                StepId::DownloadOsm
+                    | StepId::ElevationTiles
+                    | StepId::ValhallaAdmins
+                    | StepId::ValhallaTiles
             );
             assert_eq!(defs.is_empty(), expected_empty, "{step:?}");
         }

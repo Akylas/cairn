@@ -92,11 +92,13 @@ else
   bad "the CLI is not in the package"
 fi
 
-if [ -n "$resources" ] && [ -x "$resources/valhalla/valhalla_build_tiles" ]; then
-  resolves "valhalla_build_tiles" "$resources/valhalla/valhalla_build_tiles"
-else
-  note "valhalla_build_tiles not packaged - that step will look on PATH"
-fi
+for tool in valhalla_build_tiles valhalla_build_admins; do
+  if [ -n "$resources" ] && [ -x "$resources/valhalla/$tool" ]; then
+    resolves "$tool" "$resources/valhalla/$tool"
+  else
+    note "$tool not packaged - that step will look on PATH"
+  fi
+done
 
 [ -n "$resources" ] && [ -f "$resources/valhalla.json" ] && note "valhalla.json present" ||
   bad "valhalla.json missing"

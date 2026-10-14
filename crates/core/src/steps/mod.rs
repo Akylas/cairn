@@ -1,3 +1,4 @@
+pub mod admins;
 pub mod archive;
 pub mod bathymap;
 pub mod command;
@@ -20,18 +21,20 @@ pub enum StepId {
     Routes,
     Bathymap,
     TerrainRgb,
+    ValhallaAdmins,
     ValhallaTiles,
     ValhallaPackage,
 }
 
 /// Every step, in a stable order for listing.
-pub const ALL_STEPS: [StepId; 8] = [
+pub const ALL_STEPS: [StepId; 9] = [
     StepId::DownloadOsm,
     StepId::ElevationTiles,
     StepId::Basemap,
     StepId::Routes,
     StepId::Bathymap,
     StepId::TerrainRgb,
+    StepId::ValhallaAdmins,
     StepId::ValhallaTiles,
     StepId::ValhallaPackage,
 ];
@@ -43,6 +46,7 @@ impl StepId {
             StepId::Routes => "Routes",
             StepId::Bathymap => "Bathymap",
             StepId::TerrainRgb => "Terrain RGB",
+            StepId::ValhallaAdmins => "Valhalla boundaries",
             StepId::ValhallaTiles => "Valhalla tiles",
             StepId::ValhallaPackage => "Valhalla package",
             StepId::DownloadOsm => "Download OSM",
@@ -97,10 +101,20 @@ impl StepId {
                  Slow, and shared between areas: it is usually built once for a parent area \
                  covering everything you route in, so routes do not stop at a border."
             }
+            StepId::ValhallaAdmins => {
+                "`valhalla_build_admins` over the OSM extract: the country and state boundaries \
+                 the graph builder looks every node up in, for which side of the road traffic \
+                 drives on, per-country access defaults and the names in instructions. Optional - \
+                 without it the graph builds, treating everywhere alike - and built once, to be \
+                 shared by every graph. It needs an extract holding whole countries, a continent \
+                 or the planet: from a region it finds no complete boundary and says so. About \
+                 150 MB and four minutes for Europe; it adds under 0.3% to a package."
+            }
             StepId::ValhallaPackage => {
                 "Packs the graph tiles covering one area into the .vtiles archive the phone \
-                 downloads. The tile list comes from a .poly, from a tilemask, or from an \
-                 existing package."
+                 downloads. The tile list comes from a .poly you name, a tilemask, or an \
+                 existing package; with none of those it is the tiles under the area's own \
+                 boundary."
             }
         }
     }
@@ -113,8 +127,11 @@ impl StepId {
             StepId::Basemap | StepId::Routes => "the OSM extract, the planetiler jar, Java 21+",
             StepId::Bathymap => "the network, python3 with geopandas, versatiles and tippecanoe",
             StepId::TerrainRgb => "sources.json and the elevation tiles",
+            StepId::ValhallaAdmins => "the OSM extract of a continent, valhalla.json",
             StepId::ValhallaTiles => "the OSM extract, valhalla.json, the elevation tiles",
-            StepId::ValhallaPackage => "the Valhalla graph, and a shape or tile list",
+            StepId::ValhallaPackage => {
+                "the Valhalla graph; the area boundary, unless a shape is named"
+            }
         }
     }
 
@@ -127,8 +144,9 @@ impl StepId {
             StepId::Routes => "routes",
             StepId::Bathymap => "bathymap",
             StepId::TerrainRgb => "terrain",
+            StepId::ValhallaAdmins => "valhalla-admins",
             StepId::ValhallaTiles => "valhalla-tiles",
-            StepId::ValhallaPackage => "package",
+            StepId::ValhallaPackage => "valhalla-package",
         }
     }
 
@@ -138,7 +156,7 @@ impl StepId {
             // Natural Earth and the landcover container are its own downloads, and it
             // never reads the OSM extract - so it has nothing to wait for.
             StepId::DownloadOsm | StepId::ElevationTiles | StepId::Bathymap => &[],
-            StepId::Basemap | StepId::Routes => &[StepId::DownloadOsm],
+            StepId::Basemap | StepId::Routes | StepId::ValhallaAdmins => &[StepId::DownloadOsm],
             StepId::TerrainRgb => &[StepId::ElevationTiles],
             StepId::ValhallaTiles => &[StepId::DownloadOsm, StepId::ElevationTiles],
             StepId::ValhallaPackage => &[StepId::ValhallaTiles],
@@ -182,7 +200,9 @@ impl StepId {
             // a single shared `.cache/bathymap`, and a global output either way
             StepId::Bathymap => Some("bathymap"),
             // both read or write the one `valhalla_tiles/` directory in the repository
-            StepId::ValhallaTiles | StepId::ValhallaPackage => Some("valhalla"),
+            StepId::ValhallaAdmins | StepId::ValhallaTiles | StepId::ValhallaPackage => {
+                Some("valhalla")
+            }
             // writes only into the area's own directory
             StepId::TerrainRgb => None,
         }
@@ -214,6 +234,18 @@ pub fn plan(requested: &[StepId]) -> Vec<StepId> {
 
     for step in requested {
         visit(*step, &mut ordered, &mut visiting);
+    }
+
+    // The boundaries are not something the graph needs - it builds without them - so there is no
+    // dependency between the two. But when both are wanted the graph has to be built after, or
+    // it is built without them and the step was pointless: so the order is kept, not the edge.
+    let admins = ordered.iter().position(|s| *s == StepId::ValhallaAdmins);
+    let tiles = ordered.iter().position(|s| *s == StepId::ValhallaTiles);
+    if let (Some(admins), Some(tiles)) = (admins, tiles) {
+        if admins > tiles {
+            let step = ordered.remove(admins);
+            ordered.insert(tiles, step);
+        }
     }
     ordered
 }
@@ -363,5 +395,23 @@ mod tests {
     fn planetiler_steps_are_flagged() {
         assert!(StepId::Basemap.is_planetiler() && StepId::Routes.is_planetiler());
         assert!(!StepId::TerrainRgb.is_planetiler());
+    }
+
+    /// The boundaries are optional for the graph, so it does not depend on them - but when both
+    /// are wanted, the graph built before them would not have them, whatever order was clicked.
+    #[test]
+    fn boundaries_come_before_the_graph_when_both_are_wanted() {
+        for requested in [
+            [StepId::ValhallaTiles, StepId::ValhallaAdmins],
+            [StepId::ValhallaAdmins, StepId::ValhallaTiles],
+        ] {
+            let p = plan(&requested);
+            let admins = p.iter().position(|s| *s == StepId::ValhallaAdmins).unwrap();
+            let tiles = p.iter().position(|s| *s == StepId::ValhallaTiles).unwrap();
+            let download = p.iter().position(|s| *s == StepId::DownloadOsm).unwrap();
+            assert!(download < admins && admins < tiles, "{p:?}");
+        }
+        // and asking for the graph alone does not drag them in
+        assert!(!plan(&[StepId::ValhallaPackage]).contains(&StepId::ValhallaAdmins));
     }
 }
