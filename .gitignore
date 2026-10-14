@@ -27,6 +27,7 @@ node_modules/
 /.terrain_rgb
 /elevation_tiles
 /valhalla_tiles
+/valhalla_admin
 /valhalla_tiles.tar
 /alpimaps_mbtiles
 /alpimaps-studio
