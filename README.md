@@ -125,6 +125,7 @@ Some flags worth knowing about, all measured on a rhone-alpes build:
 | `max_point_buffer=4` | caps the buffer on point layers. `place` declares 256px — nine times a tile's own area — so leaving it uncapped costs tens of MB |
 | `landcover_merge_maxzoom` | merges landcover polygons at z14, where most of the bytes are. −19% of that layer |
 | `transportation_surface_detail` | road surface and tracktype on every class, +0.84%. Reaches 73% of tracks — the difference between riding and pushing |
+| `transportation_cycleway` | `cycleway_l` / `cycleway_r` (cycle infrastructure on the road, per side: shared, lane, separated, separate path) and `shoulder` from z13, on the roads that have them. Size cost not measured yet |
 | `water_pool_tolerance=1` | simplifies swimming pools, which carry ~99 vertices each for a shape a pixel across |
 | `drop_redundant_name_int` | omits `name_int` where it duplicates `name`, −0.88% |
 | `poi_custom_ranks` | orders POI labels for an outdoor map (pharmacy, drinking water and bakery ahead of schools) instead of OpenMapTiles' order |
