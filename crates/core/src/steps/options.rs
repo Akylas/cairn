@@ -419,6 +419,20 @@ pub fn basemap_options() -> Vec<OptionDef> {
             "Lowest zoom carrying `surface_detail`. z13 adds roughly 0.9 MB on rhone-alpes and \
              z12 a further 0.2 MB, to label roads that are hairlines at those zooms.",
             "14"),
+        opt("transportation_cycleway", "transportation_cycleway", "Road cycle infrastructure", "Layers",
+            OptionKind::Bool,
+            "Emit `cycleway_l` and `cycleway_r`, the cycle infrastructure on the road itself for \
+             each side relative to the line direction (1 shared lane, 2 painted or advisory lane, \
+             3 physically separated: a track, or a lane with a kerb, bollard or flex post, 4 a \
+             separate path mapped as its own way), and `shoulder=1`. Absent means none or \
+             unknown. Lines carrying `cycleway_l`/`cycleway_r` are no longer merged, since their \
+             sides depend on the line direction. Cost not measured yet; it touches a small share \
+             of roads.",
+            "off"),
+        opt("transportation_cycleway_minzoom", "transportation_cycleway_minzoom", "Cycleway min zoom", "Layers",
+            OptionKind::Int { min: Some(0), max: Some(15) },
+            "Lowest zoom carrying `cycleway_l`, `cycleway_r` and `shoulder`.",
+            "13"),
     ]);
     defs
 }
