@@ -114,6 +114,19 @@ impl TerrainArchive {
         identity: &str,
         mode: ResumeMode,
     ) -> Result<(Self, Option<Resumed>)> {
+        let meta = ArchiveMeta::terrain(name, opts, bounds, image_format);
+        Self::open_meta(path, format, &meta, identity, mode)
+    }
+
+    /// The same, for an archive that says what it holds itself: the terrain call above is this
+    /// with terrain's description, and the contour step calls it with a vector layer's.
+    pub fn open_meta(
+        path: &Path,
+        format: ArchiveFormat,
+        meta: &ArchiveMeta,
+        identity: &str,
+        mode: ResumeMode,
+    ) -> Result<(Self, Option<Resumed>)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -122,13 +135,11 @@ impl TerrainArchive {
         }
         let (archive, resumed) = match format {
             ArchiveFormat::MBTiles => {
-                let (a, r) =
-                    MBTilesArchive::open(path, name, opts, bounds, image_format, identity)?;
+                let (a, r) = MBTilesArchive::open(path, meta, identity)?;
                 (TerrainArchive::MBTiles(Box::new(a)), r)
             }
             ArchiveFormat::PMTiles => {
-                let (a, r) =
-                    PMTilesArchive::open(path, name, opts, bounds, image_format, identity, mode)?;
+                let (a, r) = PMTilesArchive::open(path, meta, identity, mode)?;
                 (TerrainArchive::PMTiles(Box::new(a)), r)
             }
         };
@@ -211,26 +222,85 @@ fn encoding_name(encoding: Encoding) -> &'static str {
     }
 }
 
-/// The metadata pairs both containers carry, in one place so they cannot disagree.
-fn metadata_pairs(
-    name: &str,
-    opts: &TerrainOptions,
-    bounds: (f64, f64, f64, f64),
-    image_format: &str,
-) -> Vec<(&'static str, String)> {
-    let encoding = encoding_name(opts.encoding);
-    vec![
-        ("name", name.to_string()),
-        ("format", image_format.to_string()),
-        ("type", "baselayer".into()),
-        ("version", "1".into()),
-        ("description", format!("{encoding} terrain rgb")),
-        // MapLibre needs this exact key to decode elevation from the tiles
-        ("encoding", encoding.into()),
-        ("minzoom", opts.minzoom.to_string()),
-        ("maxzoom", opts.maxzoom.to_string()),
-        ("bounds", format!("{},{},{},{}", bounds.0, bounds.1, bounds.2, bounds.3)),
-    ]
+/// What the tiles in an archive are, which decides the PMTiles header and the `format` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileKind {
+    Webp,
+    Png,
+    /// Gzipped Mapbox Vector Tiles.
+    Mvt,
+}
+
+impl TileKind {
+    pub fn from_image_format(format: &str) -> Self {
+        match format {
+            "png" => TileKind::Png,
+            _ => TileKind::Webp,
+        }
+    }
+
+    fn tile_type(self) -> TileType {
+        match self {
+            TileKind::Webp => TileType::Webp,
+            TileKind::Png => TileType::Png,
+            TileKind::Mvt => TileType::Mvt,
+        }
+    }
+
+    /// WebP and PNG are already compressed, and gzipping them again costs time and grows the
+    /// file. Vector tiles are the opposite: they are written gzipped, and the header has to say so.
+    fn compression(self) -> Compression {
+        match self {
+            TileKind::Mvt => Compression::Gzip,
+            _ => Compression::None,
+        }
+    }
+}
+
+/// What an archive says about itself, for both containers.
+///
+/// Both carry the same pairs - an mbtiles as rows, a PMTiles as one JSON object - so the list is
+/// built once here and the writers only decide how to store it. It also is what lets terrain and
+/// the contour step share a writer that knows nothing about either.
+#[derive(Debug, Clone)]
+pub struct ArchiveMeta {
+    pub kind: TileKind,
+    pub minzoom: u8,
+    pub maxzoom: u8,
+    pub bounds: (f64, f64, f64, f64),
+    /// Every key to store, `name`, `format`, `minzoom`, `maxzoom` and `bounds` included.
+    pub pairs: Vec<(String, String)>,
+}
+
+impl ArchiveMeta {
+    /// Terrain-RGB: a base layer whose `encoding` MapLibre needs to decode the elevation.
+    pub fn terrain(
+        name: &str,
+        opts: &TerrainOptions,
+        bounds: (f64, f64, f64, f64),
+        image_format: &str,
+    ) -> Self {
+        let encoding = encoding_name(opts.encoding);
+        let pairs = vec![
+            ("name", name.to_string()),
+            ("format", image_format.to_string()),
+            ("type", "baselayer".into()),
+            ("version", "1".into()),
+            ("description", format!("{encoding} terrain rgb")),
+            // MapLibre needs this exact key to decode elevation from the tiles
+            ("encoding", encoding.into()),
+            ("minzoom", opts.minzoom.to_string()),
+            ("maxzoom", opts.maxzoom.to_string()),
+            ("bounds", format!("{},{},{},{}", bounds.0, bounds.1, bounds.2, bounds.3)),
+        ];
+        Self {
+            kind: TileKind::from_image_format(image_format),
+            minzoom: opts.minzoom,
+            maxzoom: opts.maxzoom,
+            bounds,
+            pairs: pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
 }
 
 fn mismatch(tiles: u64) -> anyhow::Error {
@@ -258,14 +328,7 @@ pub struct MBTilesArchive {
 }
 
 impl MBTilesArchive {
-    fn open(
-        path: &Path,
-        name: &str,
-        opts: &TerrainOptions,
-        bounds: (f64, f64, f64, f64),
-        image_format: &str,
-        identity: &str,
-    ) -> Result<(Self, Option<Resumed>)> {
+    fn open(path: &Path, meta: &ArchiveMeta, identity: &str) -> Result<(Self, Option<Resumed>)> {
         let partial = mb_partial_path(path);
         if partial.exists() {
             if let Some((conn, resumed)) = Self::resume(&partial, identity)? {
@@ -290,7 +353,7 @@ impl MBTilesArchive {
              CREATE TABLE cairn_progress (identity text, zoom integer, next_batch integer,
                wanted_count integer, wanted_hash integer);",
         )?;
-        for (key, value) in metadata_pairs(name, opts, bounds, image_format) {
+        for (key, value) in &meta.pairs {
             conn.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))?;
         }
         conn.execute(
@@ -539,33 +602,30 @@ fn read_journal(path: &Path, spill_have: u64) -> Option<Recovered> {
 impl PMTilesArchive {
     fn open(
         path: &Path,
-        name: &str,
-        opts: &TerrainOptions,
-        bounds: (f64, f64, f64, f64),
-        image_format: &str,
+        meta: &ArchiveMeta,
         identity: &str,
         mode: ResumeMode,
     ) -> Result<(Self, Option<Resumed>)> {
-        let tile_type = match image_format {
-            "png" => TileType::Png,
-            _ => TileType::Webp,
-        };
-
         // The metadata is JSON here rather than a table. `encoding` has to survive that move or
-        // MapLibre cannot decode the elevation, which is the whole point of the archive.
-        let metadata: serde_json::Map<String, serde_json::Value> =
-            metadata_pairs(name, opts, bounds, image_format)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
-                .collect();
+        // MapLibre cannot decode the elevation, which is the whole point of a terrain archive.
+        let mut metadata = serde_json::Map::new();
+        for (key, value) in &meta.pairs {
+            // An mbtiles keeps its layer list in a `json` row holding an object; TileJSON, which
+            // a PMTiles follows, wants that object's keys at the top level instead.
+            if key == "json" {
+                if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(value) {
+                    metadata.extend(object);
+                    continue;
+                }
+            }
+            metadata.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
 
-        let writer = PmTilesWriter::new(tile_type)
-            // WebP and PNG are already compressed; gzipping them again costs time and grows
-            // the file
-            .tile_compression(Compression::None)
-            .min_zoom(opts.minzoom)
-            .max_zoom(opts.maxzoom)
-            .bounds(bounds.0, bounds.1, bounds.2, bounds.3)
+        let writer = PmTilesWriter::new(meta.kind.tile_type())
+            .tile_compression(meta.kind.compression())
+            .min_zoom(meta.minzoom)
+            .max_zoom(meta.maxzoom)
+            .bounds(meta.bounds.0, meta.bounds.1, meta.bounds.2, meta.bounds.3)
             .metadata(&serde_json::Value::Object(metadata).to_string());
 
         let spill_path = pm_spill_path(path);

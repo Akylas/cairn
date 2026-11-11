@@ -72,6 +72,7 @@ pub enum ArtifactKind {
     Routes,
     Bathymap,
     TerrainRgb,
+    Contours,
     Hillshade,
     ValhallaPackage,
     Unknown,
@@ -164,6 +165,7 @@ fn kind_from_name(suffix: Option<&str>, ext: &str) -> ArtifactKind {
         (Some("routes"), _) => ArtifactKind::Routes,
         (Some("bathymap"), _) => ArtifactKind::Bathymap,
         (Some("terrain"), _) => ArtifactKind::TerrainRgb,
+        (Some("contours"), _) => ArtifactKind::Contours,
         (Some("hillshade"), _) => ArtifactKind::Hillshade,
         (_, "vtiles") => ArtifactKind::ValhallaPackage,
         // PMTiles is not SQLite, so the metadata pass cannot open it and the name is all there
@@ -200,6 +202,10 @@ fn kind_from_metadata(
             // the routes build emits exactly one layer; the basemap emits ~19
             if layers.len() == 1 && layers[0].id == "route" {
                 Some(ArtifactKind::Routes)
+            } else if layers.len() == 1 && layers[0].fields.contains_key("ele") {
+                // one layer of lines carrying elevations is a contour archive, whatever the layer
+                // was named - the name is an option of the step
+                Some(ArtifactKind::Contours)
             } else if layers.iter().any(|l| l.id == "depth" || l.id == "global_landcover") {
                 Some(ArtifactKind::Bathymap)
             } else {
@@ -335,8 +341,10 @@ pub fn probe(path: &Path, area: &str) -> Artifact {
     };
 
     // a suffix that is not a known kind is a variant of one: `_mlt` is still a basemap
-    let known_suffix =
-        matches!(suffix.as_deref(), Some("routes") | Some("terrain") | Some("hillshade"));
+    let known_suffix = matches!(
+        suffix.as_deref(),
+        Some("routes") | Some("terrain") | Some("contours") | Some("hillshade")
+    );
     artifact.variant = match (suffix.as_deref(), trailing.as_deref()) {
         (Some(s), Some(t)) if !known_suffix => Some(format!("{s}.{t}")),
         (Some(s), None) if !known_suffix => Some(s.to_string()),

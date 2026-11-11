@@ -224,6 +224,10 @@
     const routes = canonicalFirst(renderable.filter((a) => a.kind === "routes"))[0];
     if (terrainArt) await addArtifact(terrainArt, "main");
     if (basemap) await addArtifact(basemap, "main");
+    // contours are a vector overlay of this pipeline too: a build that just made them is shown
+    // with them, above the basemap and under the routes
+    const contours = canonicalFirst(renderable.filter((a) => a.kind === "contours"))[0];
+    if (contours) await addArtifact(contours, "main");
     if (routes) await addArtifact(routes, "main");
     routePackage = packages[0]?.file_name ?? "";
   }

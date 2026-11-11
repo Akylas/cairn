@@ -1,5 +1,6 @@
 pub mod bathymap;
 pub mod catalog;
+pub mod contours;
 pub mod options;
 pub mod planetiler;
 pub mod profile;

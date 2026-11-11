@@ -21,19 +21,21 @@ pub enum StepId {
     Routes,
     Bathymap,
     TerrainRgb,
+    Contours,
     ValhallaAdmins,
     ValhallaTiles,
     ValhallaPackage,
 }
 
 /// Every step, in a stable order for listing.
-pub const ALL_STEPS: [StepId; 9] = [
+pub const ALL_STEPS: [StepId; 10] = [
     StepId::DownloadOsm,
     StepId::ElevationTiles,
     StepId::Basemap,
     StepId::Routes,
     StepId::Bathymap,
     StepId::TerrainRgb,
+    StepId::Contours,
     StepId::ValhallaAdmins,
     StepId::ValhallaTiles,
     StepId::ValhallaPackage,
@@ -46,6 +48,7 @@ impl StepId {
             StepId::Routes => "Routes",
             StepId::Bathymap => "Bathymap",
             StepId::TerrainRgb => "Terrain RGB",
+            StepId::Contours => "Contours",
             StepId::ValhallaAdmins => "Valhalla boundaries",
             StepId::ValhallaTiles => "Valhalla tiles",
             StepId::ValhallaPackage => "Valhalla package",
@@ -94,7 +97,16 @@ impl StepId {
             StepId::TerrainRgb => {
                 "Terrarium-packed elevation from the sources in sources.json, lowest priority \
                  first, blended over `blur` metres at each source's coverage edge. The map draws \
-                 hillshade and 3D terrain from these; there is no contour archive any more."
+                 hillshade and 3D terrain from these."
+            }
+            StepId::Contours => {
+                "Contour lines as vector tiles, traced straight from the same elevation sources \
+                 the terrain step reads - no GeoTIFF to build first, no GDAL, no tippecanoe. Each \
+                 tile is sampled into a grid, traced with marching squares, simplified and \
+                 encoded by a worker of its own, so it scales with the cores and is not slowed by \
+                 the area's size. Every line carries `ele` and `div`, the largest of 1000, 500, \
+                 250, 200, 100, 50, 20 and 10 its elevation is a multiple of, and low zooms keep \
+                 only the important ones. Interrupted builds continue where they stopped."
             }
             StepId::ValhallaTiles => {
                 "`valhalla_build_tiles` over the OSM extract, using the configured valhalla.json. \
@@ -127,6 +139,7 @@ impl StepId {
             StepId::Basemap | StepId::Routes => "the OSM extract, the planetiler jar, Java 21+",
             StepId::Bathymap => "the network, python3 with geopandas, versatiles and tippecanoe",
             StepId::TerrainRgb => "sources.json and the elevation tiles",
+            StepId::Contours => "sources.json and the elevation tiles",
             StepId::ValhallaAdmins => "the OSM extract of a continent, valhalla.json",
             StepId::ValhallaTiles => "the OSM extract, valhalla.json, the elevation tiles",
             StepId::ValhallaPackage => {
@@ -144,6 +157,7 @@ impl StepId {
             StepId::Routes => "routes",
             StepId::Bathymap => "bathymap",
             StepId::TerrainRgb => "terrain",
+            StepId::Contours => "contours",
             StepId::ValhallaAdmins => "valhalla-admins",
             StepId::ValhallaTiles => "valhalla-tiles",
             StepId::ValhallaPackage => "valhalla-package",
@@ -157,7 +171,7 @@ impl StepId {
             // never reads the OSM extract - so it has nothing to wait for.
             StepId::DownloadOsm | StepId::ElevationTiles | StepId::Bathymap => &[],
             StepId::Basemap | StepId::Routes | StepId::ValhallaAdmins => &[StepId::DownloadOsm],
-            StepId::TerrainRgb => &[StepId::ElevationTiles],
+            StepId::TerrainRgb | StepId::Contours => &[StepId::ElevationTiles],
             StepId::ValhallaTiles => &[StepId::DownloadOsm, StepId::ElevationTiles],
             StepId::ValhallaPackage => &[StepId::ValhallaTiles],
         }
@@ -204,7 +218,7 @@ impl StepId {
                 Some("valhalla")
             }
             // writes only into the area's own directory
-            StepId::TerrainRgb => None,
+            StepId::TerrainRgb | StepId::Contours => None,
         }
     }
 }

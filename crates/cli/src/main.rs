@@ -52,6 +52,8 @@ enum Command {
     Bathymap(steps::bathymap::Args),
     /// Build terrain-RGB tiles from the sources in sources.json.
     Terrain(steps::terrain::Args),
+    /// Build contour lines as vector tiles from the sources in sources.json.
+    Contours(steps::contours::Args),
     /// Build the country and state boundaries the Valhalla graph builder looks nodes up in.
     ValhallaAdmins(steps::tools::ToolArgs),
     /// Build the Valhalla routing graph from the OSM extract.
@@ -88,6 +90,7 @@ async fn main() -> Result<()> {
         Command::Routes(args) => steps::planetiler::run(&settings, args, true).await,
         Command::Bathymap(args) => steps::bathymap::run(&settings, args).await,
         Command::Terrain(args) => steps::terrain::run(&settings, args).await,
+        Command::Contours(args) => steps::contours::run(&settings, args).await,
         Command::ValhallaPackage(args) => steps::valhalla::package(&settings, args).await,
         Command::Unpack(args) => steps::valhalla::unpack(args),
         Command::Route(args) => steps::valhalla::route(&settings, args),
@@ -162,6 +165,50 @@ mod command_line_tests {
 
     /// Parsing is not the same as meaning it: the terrain line has to carry the choices that
     /// decide what gets built.
+    #[test]
+    fn the_contours_line_round_trips_its_values() {
+        let settings = Settings::for_repo(std::path::PathBuf::from("/work/cairn"));
+        let values: BTreeMap<String, Value> = [
+            ("minzoom", json!(10)),
+            ("maxzoom", json!(13)),
+            ("interval", json!(20)),
+            ("simplify", json!(1.5)),
+            ("resolution", json!(5.0)),
+            ("polyzoom", json!(9)),
+            ("match_basemap", json!(true)),
+            ("pmtiles", json!(true)),
+            ("fresh", json!(true)),
+            ("download_elevation", json!(false)),
+            ("name", json!("Contours-20m")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let argv = command::argv(&settings, StepId::Contours, "alps", &values, &[]);
+        let Cli { command: Command::Contours(args), .. } = Cli::try_parse_from(&argv).unwrap()
+        else {
+            panic!("not a contours command: {argv:?}");
+        };
+        assert_eq!((args.minzoom, args.maxzoom, args.interval, args.polyzoom), (10, 13, 20, 9));
+        assert_eq!((args.simplify, args.resolution), (1.5, 5.0));
+        assert!(args.match_basemap && args.pmtiles && args.fresh && args.no_elevation_download);
+        assert_eq!(args.name.as_deref(), Some("Contours-20m"));
+        assert!(!args.area_poly, "the form's default is off and the line says so");
+    }
+
+    /// Untouched, the command line builds what the script's defaults built.
+    #[test]
+    fn the_contours_defaults_are_the_old_scripts() {
+        let Cli { command: Command::Contours(args), .. } =
+            Cli::try_parse_from(["cairn", "contours", "--area", "x"]).unwrap()
+        else {
+            panic!("not a contours command");
+        };
+        let from_flags = args.options_for_test();
+        assert_eq!(from_flags, cairn_core::contours::ContourOptions::default());
+        assert_eq!((args.minzoom, args.maxzoom, args.polyzoom), (11, 14, 11));
+    }
+
     #[test]
     fn the_terrain_line_round_trips_its_values() {
         let settings = Settings::for_repo(std::path::PathBuf::from("/work/cairn"));

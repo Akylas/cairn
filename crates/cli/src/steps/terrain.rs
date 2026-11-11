@@ -110,12 +110,63 @@ fn terrain_options(args: &Args) -> std::collections::BTreeMap<String, serde_json
     values
 }
 
-fn parse_bounds(raw: &str) -> Result<(f64, f64, f64, f64)> {
+pub(crate) fn parse_bounds(raw: &str) -> Result<(f64, f64, f64, f64)> {
     let parts: Vec<f64> = raw.split(',').filter_map(|p| p.trim().parse().ok()).collect();
     match parts.as_slice() {
         [w, s, e, n] => Ok((*w, *s, *e, *n)),
         _ => Err(anyhow!("bounds want west,south,east,north")),
     }
+}
+
+/// The elevation sources to read, in priority order, and where they and the `.hgt` tiles were
+/// looked for.
+///
+/// `sources.json` is the pipeline's own list; without one, the bare `.hgt` directory is a usable
+/// source on its own, which is what a fresh install has. Shared by every step that samples
+/// elevation.
+pub(crate) fn load_specs(
+    settings: &Settings,
+    sources: Option<PathBuf>,
+    elevation_dir: Option<PathBuf>,
+) -> Result<(Vec<source::SourceSpec>, PathBuf, PathBuf)> {
+    let sources_path = sources.unwrap_or_else(|| settings.sources_json.clone());
+    let hgt_dir = elevation_dir.unwrap_or_else(|| settings.elevation_tiles_dir.clone());
+    let specs = match source::read_specs(&sources_path) {
+        Ok(specs) => specs,
+        Err(e) if hgt_dir.is_dir() => {
+            println!("no {} ({e}); reading {}", sources_path.display(), hgt_dir.display());
+            vec![source::SourceSpec {
+                name: "elevation_tiles".into(),
+                kind: "valhalla".into(),
+                path: hgt_dir.clone(),
+                clamp_min: Some(-10.0),
+                download: None,
+                ..Default::default()
+            }]
+        }
+        Err(e) => return Err(e),
+    };
+    Ok((specs, sources_path, hgt_dir))
+}
+
+/// The bounds of the area's basemap, which keep an output's coverage identical to the vector tiles.
+pub(crate) fn basemap_bounds(settings: &Settings, area: &str) -> Result<(f64, f64, f64, f64)> {
+    cairn_core::catalog::discover(&settings.output_root)?
+        .into_iter()
+        .find(|a| a.name == area)
+        .and_then(|a| {
+            a.artifacts
+                .iter()
+                .find(|x| x.kind == cairn_core::catalog::ArtifactKind::Basemap)?
+                .bounds
+                .clone()
+        })
+        .as_deref()
+        .map(parse_bounds)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow!("no --bounds or --poly-shape given, and no basemap to take them from")
+        })
 }
 
 pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
@@ -132,26 +183,8 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
     let encoding = Encoding::parse(&args.encoding)
         .ok_or_else(|| anyhow!("unknown encoding `{}`", args.encoding))?;
     let suffix = "terrain";
-    let sources_path = args.sources.clone().unwrap_or_else(|| settings.sources_json.clone());
-    let hgt_dir =
-        args.elevation_dir.clone().unwrap_or_else(|| settings.elevation_tiles_dir.clone());
-    // sources.json is the pipeline's own list, in priority order; without one, the bare .hgt
-    // directory is a usable source on its own, which is what a fresh install has
-    let specs = match source::read_specs(&sources_path) {
-        Ok(specs) => specs,
-        Err(e) if hgt_dir.is_dir() => {
-            println!("no {} ({e}); reading {}", sources_path.display(), hgt_dir.display());
-            vec![source::SourceSpec {
-                name: "elevation_tiles".into(),
-                kind: "valhalla".into(),
-                path: hgt_dir.clone(),
-                clamp_min: Some(-10.0),
-                download: None,
-                ..Default::default()
-            }]
-        }
-        Err(e) => return Err(e),
-    };
+    let (specs, sources_path, hgt_dir) =
+        load_specs(settings, args.sources.clone(), args.elevation_dir.clone())?;
     let (composite, skipped) = source::CompositeSource::open(&specs)?;
     if args.dry_run {
         println!("sources, highest priority first: {:?}", composite.names());
@@ -172,22 +205,7 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
     let bounds = match (&args.bounds, &shape) {
         (Some(raw), _) => parse_bounds(raw)?,
         (None, Some(shape)) => shape.bounds(),
-        (None, None) => cairn_core::catalog::discover(&settings.output_root)?
-            .into_iter()
-            .find(|a| a.name == args.area)
-            .and_then(|a| {
-                a.artifacts
-                    .iter()
-                    .find(|x| x.kind == cairn_core::catalog::ArtifactKind::Basemap)?
-                    .bounds
-                    .clone()
-            })
-            .as_deref()
-            .map(parse_bounds)
-            .transpose()?
-            .ok_or_else(|| {
-                anyhow!("no --bounds or --poly-shape given, and no basemap to take them from")
-            })?,
+        (None, None) => basemap_bounds(settings, &args.area)?,
     };
 
     let opts = render::TerrainOptions {

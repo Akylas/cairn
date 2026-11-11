@@ -298,6 +298,28 @@ impl RenderPool {
         }
     }
 
+    /// Fetch what these queries will read, ahead of using them.
+    ///
+    /// [`prefetch`](Self::prefetch) for a caller that works out its own queries: the contour
+    /// step reads a grid of its own size around each tile, not a terrain tile's pixels.
+    pub fn prefetch_queries(&self, queries: &[TileQuery]) {
+        if let Ok(mut source) = self.prefetcher.lock() {
+            source.prefetch(queries);
+        }
+    }
+
+    /// Run `work` on the source that belongs to the calling thread.
+    ///
+    /// The pool's one-source-per-thread rule, for a caller that does something other than render
+    /// a terrain tile with it. Meant to be called from inside a rayon parallel iterator.
+    pub fn with_source<R>(&self, work: impl FnOnce(&mut CompositeSource) -> R) -> Result<R> {
+        let index = rayon::current_thread_index().unwrap_or(0) % self.sources.len();
+        let mut source = self.sources[index]
+            .lock()
+            .map_err(|_| anyhow::anyhow!("a renderer was left poisoned by a panic"))?;
+        Ok(work(&mut source))
+    }
+
     /// Render and encode a batch of tiles, in parallel, returning the ones that had coverage.
     ///
     /// Encoding runs here too rather than in the caller: lossless WebP is a good fraction of the

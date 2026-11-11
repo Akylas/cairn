@@ -233,15 +233,51 @@ contours. The extra tiles needed to average a zoom from its 4 children are worke
 separately and never written.
 
 ## # Then build contours
+
 ```shell
-./tools/legacy/scripts/build_contours.sh  --minzoom 11 --maxzoom 14 --poly-shape $POLY --output ${OUTPUT_DIR}/${AREA}/${AREA}_contours.mbtiles ${AREA}.tif
+cairn contours --area ${AREA} --minzoom 11 --maxzoom 14 --poly-shape $POLY \
+  --output ${OUTPUT_DIR}/${AREA}/${AREA}_contours.mbtiles
 ```
 
+This replaces `build_contours.sh`, and with it the `${AREA}.tif` the script needed: there is no
+`generate_tif_from_hgt.sh` step, no `gdal_contour`, no `ogr2ogr` and no tippecanoe. The lines are traced
+straight from `sources.json` - the same sources, in the same priority order and blended the same way as
+terrain-RGB - tile by tile, in parallel, and written to the archive as they finish. An interrupted build
+continues from its last batch, and `--pmtiles` writes PMTiles instead.
+
+What the script produced is kept:
+
+| the script | `cairn contours` |
+| --- | --- |
+| `--minzoom` / `--maxzoom` (11 / 14) | the same flags and defaults |
+| `--poly-shape` | the same: only tiles the shape touches are written |
+| `--polyzoom` (11), the `tilemask` stamped by `generate_poly_tilemask.py` | `--polyzoom`; the mask goes in the archive's `tilemask` metadata |
+| `--bounds` | the same |
+| `--name` (`Contours-10m`) | `--name`, defaulting to `<area>_contours` |
+| `gdal_contour -i 10 -a ele` | `--interval 10`; every line has `ele` |
+| the `div` computed in SQL | the same ladder: the largest of 1000, 500, 250, 200, 100, 50, 20, 10 that `ele` is a multiple of |
+| tippecanoe's `-j` filter on `$zoom` and `div` | the same table: z0-6 keep `div >= 1000`, z7 `>= 500`, z8-9 `>= 200` but not 500, z10-12 `>= 100`, z13 `>= 50`, z14 all |
+| tippecanoe `-S 3`, `-b 5` (layer `contour`, detail 12) | `--simplify 3`, a buffer of 80 of 4096 tile units, `--layer contour`, extent 4096 |
+| `filter_tiles_from_other_mbtiles.py` (the cleanup below) | `--match-basemap`, which skips the tiles instead of deleting them afterwards |
+
+The zoom filter is the script's, quirk included: it keeps a 250 m line at zoom 8 and 9 and drops the
+500 m one. With the default minimum zoom of 11 that never applies; it is a table in
+`crates/core/src/contours/mod.rs` if you want it changed.
+
+Two options have no equivalent in the script because the script sampled whatever resolution the GeoTIFF
+had. `--resolution` (default 10) is the finest spacing, in metres, the elevation is sampled at for a tile:
+lower it to 5 for a 5 m source. `--max-grid` (default 256) caps the samples along a tile's side, which is
+what bounds the low zooms. Neither can make the lines more accurate than the source is.
+
 ## # Cleanup contours mbtiles
-This steps ensure we have the same tiles in the area mbtiles and terrain/contours. It is important in AlpiMaps as we merge tiles from area and contours to draw contour lines in between the map style. 
+The app merges the contour tile and the basemap tile of one position, so a contour tile with no basemap tile
+under it is never drawn. The old pipeline deleted those afterwards:
 ```shell
 python ./tools/legacy/scripts/filter_tiles_from_other_mbtiles.py --sourcembtiles ${OUTPUT_DIR}/${AREA}/${AREA}.mbtiles ${OUTPUT_DIR}/${AREA}/${AREA}_contours.mbtiles
 ```
+`cairn contours --match-basemap` does it while building: only the tiles `${AREA}.mbtiles` (or `.pmtiles`) has are
+rendered, so nothing is made to be thrown away. Build the basemap first.
+
 ## # build valhalla package
 
 ### Download the elevation tiles

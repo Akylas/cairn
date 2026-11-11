@@ -341,7 +341,7 @@
       note: "what the map renders",
       // stacked layers
       icon: "M2 5.2 8 2.2l6 3-6 3-6-3Zm0 3.4 6 3 6-3M2 11.6l6 3 6-3",
-      steps: ["basemap", "routes", "bathymap", "terrain_rgb"],
+      steps: ["basemap", "routes", "bathymap", "terrain_rgb", "contours"],
     },
     {
       id: "routing",
@@ -376,7 +376,7 @@
 
   /// Steps whose output the map can draw. A run of only `download_osm` has nothing new to
   /// show, so it should not yank anyone over to the map tab.
-  const MAPPABLE = ["basemap", "routes", "terrain_rgb"];
+  const MAPPABLE = ["basemap", "routes", "terrain_rgb", "contours"];
 
   const fmtSize = (b) =>
     b > 1073741824 ? `${(b / 1073741824).toFixed(1)} GB`
@@ -659,25 +659,31 @@
     buildConfig.lines = cliLines;
   });
 
-  // An interrupted terrain build keeps what it wrote, and the next run continues it. Said here,
-  // because otherwise the only sign of it is a run that is oddly fast to start.
-  let partial = $state(null);
+  // An interrupted terrain or contour build keeps what it wrote, and the next run continues it.
+  // Said here, because otherwise the only sign of it is a run that is oddly fast to start.
+  const RESUMABLE = ["terrain_rgb", "contours"];
+  let partials = $state({});
   async function refreshPartial() {
-    if (!area) { partial = null; return; }
-    try {
-      partial = await invoke("terrain_partial", {
-        area, pmtiles: values.terrain_rgb?.pmtiles === true,
-      });
-    } catch { partial = null; }
+    if (!area) { partials = {}; return; }
+    const next = {};
+    for (const step of RESUMABLE) {
+      try {
+        const found = await invoke("terrain_partial", {
+          area, step, pmtiles: values[step]?.pmtiles === true,
+        });
+        if (found) next[step] = found;
+      } catch { /* nothing to resume is the same as no answer */ }
+    }
+    partials = next;
   }
   $effect(() => {
-    area; values.terrain_rgb?.pmtiles; running;
+    area; values.terrain_rgb?.pmtiles; values.contours?.pmtiles; running;
     refreshPartial();
   });
-  async function discardPartial() {
+  async function discardPartial(step) {
     try {
       await invoke("terrain_discard_partial", {
-        area, pmtiles: values.terrain_rgb?.pmtiles === true,
+        area, step, pmtiles: values[step]?.pmtiles === true,
       });
     } catch (err) { javaError = String(err); }
     await refreshPartial();
@@ -994,13 +1000,14 @@
 {#each optionSteps as step, i}
   <Section title={`3.${i + 1} · ${labelFor(step)}`} open={false}
            subtitle={setCountFor(step) ? `${setCountFor(step)} set` : "defaults"}>
-    {#if step === "terrain_rgb" && partial}
+    {#if partials[step]}
+      {@const partial = partials[step]}
       <p class="warn partial">
         An interrupted build is here: up to z{partial.zoom}, {partial.tiles.toLocaleString()} tiles,
         {fmtSize(partial.bytes)}. Running again continues it. It was started with
         particular settings, and a run with different ones is refused rather than mixed in;
         tick <em>Start over</em> below to discard it, or
-        <button class="ghost tiny" onclick={discardPartial} disabled={running}>discard it now</button>.
+        <button class="ghost tiny" onclick={() => discardPartial(step)} disabled={running}>discard it now</button>.
       </p>
     {/if}
     {#if lineFor(step)}

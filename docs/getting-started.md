@@ -50,6 +50,7 @@ For terrain and routing:
 ```shell
 cairn elevation      --area monaco  # the .hgt tiles the graph and the terrain need
 cairn terrain        --area monaco  # terrain-RGB
+cairn contours       --area monaco  # contour lines, from the same elevation
 cairn valhalla-tiles --area monaco  # the routing graph
 cairn valhalla-package --area monaco  # → output/monaco/monaco.vtiles
 ```
@@ -81,7 +82,7 @@ The archives are ordinary files. Point `tileserver-gl`, QGIS or a MapLibre style
 ## 5. Make it yours
 
 * **Another area** — change `--area`. Cairn resolves it through Geofabrik's index and downloads the matching
-  `.poly` to clip to. To clip to a shape of your own, pass it as `--polygon my-region.poly` (basemap, routes), `--poly-shape` (terrain) or `--poly` (package).
+  `.poly` to clip to. To clip to a shape of your own, pass it as `--polygon my-region.poly` (basemap, routes), `--poly-shape` (terrain, contours) or `--poly` (package).
 * **Smaller or richer tiles** — `cairn options basemap --presets`, then `-o name=value`. See
   [Tuning](../README.md#tuning).
 * **Better elevation** — terrain is composed from the sources in [`config/sources.json`](../config/sources.json),

@@ -179,6 +179,7 @@ Every step runs from the app now:
 | Elevation tiles | the `.hgt` tiles for the area's bounds, downloaded from the Skadi mirror |
 | Basemap, Routes | planetiler, as a subprocess |
 | Terrain RGB | the Rust renderer in `crates/core/src/terrain` |
+| Contours | the Rust tracer in `crates/core/src/contours`; `build_contours.sh`, `gdal_contour` and tippecanoe are gone |
 | Hillshade | the same renderer with mapbox packing, which is all `_hillshade` ever was |
 | Valhalla tiles | `valhalla_build_tiles` |
 | Valhalla package | the Rust packer in `crates/core/src/valhalla/package.rs` |

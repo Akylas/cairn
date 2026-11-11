@@ -7,6 +7,7 @@
 pub mod buildconfig;
 pub mod cancel;
 pub mod catalog;
+pub mod contours;
 pub mod elevation;
 pub mod poly;
 pub mod presets;

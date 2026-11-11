@@ -299,6 +299,180 @@ pub fn terrain_options() -> Vec<OptionDef> {
     ]
 }
 
+/// Contour options: the old `build_contours.sh`'s flags, and what the new pipeline adds to them.
+pub fn contour_options() -> Vec<OptionDef> {
+    vec![
+        pmtiles_option(),
+        opt(
+            "minzoom",
+            "minzoom",
+            "Min zoom",
+            "Zooms",
+            OptionKind::Int { min: Some(0), max: Some(15) },
+            "Lowest zoom written. Below it the map has no lines at all, which is the point: the \
+             lines at a low zoom are a dense wash. The zoom filter on `div` still applies.",
+            "11",
+        ),
+        opt(
+            "maxzoom",
+            "maxzoom",
+            "Max zoom",
+            "Zooms",
+            OptionKind::Int { min: Some(0), max: Some(15) },
+            "Highest zoom written. The top zoom is most of the archive and most of the time.",
+            "14",
+        ),
+        opt(
+            "interval",
+            "interval",
+            "Interval",
+            "Lines",
+            OptionKind::Int { min: Some(1), max: Some(1000) },
+            "Metres between two lines. Every line carries `ele`, and `div`: the largest of \
+             1000, 500, 250, 200, 100, 50, 20 and 10 that its elevation is a multiple of, which \
+             the zoom filter and a style's heavier index lines read.",
+            "10",
+        ),
+        opt(
+            "layer",
+            "layer",
+            "Layer name",
+            "Lines",
+            OptionKind::Text,
+            "Name of the vector layer the lines are in.",
+            "contour",
+        ),
+        opt(
+            "name",
+            "name",
+            "Archive name",
+            "Output",
+            OptionKind::Text,
+            "The `name` in the archive's metadata, which tile servers show.",
+            "<area>_contours",
+        ),
+        opt(
+            "simplify",
+            "simplify",
+            "Simplification",
+            "Lines",
+            OptionKind::Float { min: Some(0.0), max: None },
+            "Douglas-Peucker tolerance in tile units, of 4096 to a tile - tippecanoe's `-S`. 0 \
+             keeps every vertex of the traced grid, which is larger and no more accurate than \
+             the elevation it came from.",
+            "3",
+        ),
+        opt(
+            "resolution",
+            "resolution",
+            "Grid spacing",
+            "Lines",
+            OptionKind::Float { min: Some(1.0), max: None },
+            "The finest the elevation is sampled for a tile, in metres between samples. Lower \
+             traces finer detail out of better data - set 5 for a 5 m source - at a cost that \
+             grows with the square. Below the ground resolution of the source it only draws the \
+             same slope through more points.",
+            "10",
+        ),
+        opt(
+            "max_grid",
+            "max-grid",
+            "Max grid",
+            "Lines",
+            OptionKind::Int { min: Some(8), max: Some(2048) },
+            "The most samples along one side of a tile, however fine the spacing asks for. It \
+             is what bounds the low zooms, where a tile is tens of kilometres across.",
+            "256",
+        ),
+        opt(
+            "blur",
+            "blur",
+            "Source blend",
+            "Sources",
+            float(0.0),
+            "Metres over which a higher-priority source fades in at its coverage boundary, so \
+             the seam between two sources is a slope and not a cliff the lines pile up on. The \
+             same value as the terrain step, so the two agree. 0 is a hard switch, and the \
+             fastest.",
+            "1000",
+        ),
+        opt(
+            "download_elevation",
+            "no-elevation-download",
+            "Fetch missing tiles",
+            "Sources",
+            OptionKind::Bool,
+            "Download any .hgt tile this build needs and does not have. A missing tile is \
+             otherwise silent: there are no lines there, and the archive has a hole.",
+            "on",
+        ),
+        opt(
+            "area_poly",
+            "area_poly",
+            "Clip to the area boundary",
+            "Sources",
+            OptionKind::Bool,
+            "Only write the tiles the area's own .poly touches, downloading it from Geofabrik if \
+             it is not already beside the extract. An explicit clip shape wins over this.",
+            "off",
+        ),
+        opt(
+            "poly_shape",
+            "poly-shape",
+            "Clip shape",
+            "Sources",
+            OptionKind::Text,
+            "Path to an osmosis .poly. Only tiles touching the shape are written, and its tile \
+             mask is stored in the archive's metadata.",
+            "the whole bounding box",
+        ),
+        opt(
+            "bounds",
+            "bounds",
+            "Bounds",
+            "Sources",
+            OptionKind::Text,
+            "west,south,east,north.",
+            "the shape's bounds, else the area's basemap bounds",
+        ),
+        opt(
+            "polyzoom",
+            "polyzoom",
+            "Tile mask zoom",
+            "Sources",
+            OptionKind::Int { min: Some(0), max: Some(15) },
+            "Zoom of the quadtree `tilemask` stored in the metadata when there is a clip shape. \
+             It starts four zooms lower and goes up until the mask is long enough to be worth \
+             having. The app that reads the archive uses it to tell which positions it covers.",
+            "11",
+        ),
+        opt(
+            "match_basemap",
+            "match-basemap",
+            "Same tiles as the basemap",
+            "Output",
+            OptionKind::Bool,
+            "Render only the tiles the area's basemap also has. An app that draws contours \
+             between the layers of the basemap merges the two tiles of one position, and a \
+             contour tile with no basemap tile under it is never drawn. This is what \
+             `filter_tiles_from_other_mbtiles.py` did afterwards - here nothing is rendered to \
+             be thrown away. Ignored, with a note, when the area has no basemap yet.",
+            "off",
+        ),
+        opt(
+            "fresh",
+            "fresh",
+            "Start over",
+            "Output",
+            OptionKind::Bool,
+            "Discard a partial build left by an interrupted run and begin again. Without it a run \
+             continues one made with the same settings, and refuses one made with different \
+             settings rather than mixing the two.",
+            "continue a matching partial build",
+        ),
+    ]
+}
+
 /// Valhalla package options.
 pub fn package_options() -> Vec<OptionDef> {
     vec![
@@ -685,6 +859,7 @@ pub fn for_step(step: crate::steps::StepId) -> Vec<OptionDef> {
         StepId::Routes => routes_options(),
         StepId::Bathymap => bathymap_options(),
         StepId::TerrainRgb => terrain_options(),
+        StepId::Contours => contour_options(),
         StepId::ValhallaPackage => package_options(),
         // the download and the two Valhalla binaries take paths and bounds, which are settings
         // rather than per-run choices

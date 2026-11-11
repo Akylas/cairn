@@ -33,7 +33,7 @@
   }
 
   const KIND_LABEL = {
-    basemap: "Basemap", routes: "Routes", terrain_rgb: "Terrain",
+    basemap: "Basemap", routes: "Routes", terrain_rgb: "Terrain", contours: "Contours",
     hillshade: "Raster", unknown: "Other",
   };
 

@@ -62,6 +62,7 @@ pub fn outputs_for(
         StepId::Routes => archive(StepId::Routes),
         StepId::Bathymap => archive(StepId::Bathymap),
         StepId::TerrainRgb => archive(StepId::TerrainRgb),
+        StepId::Contours => archive(StepId::Contours),
         StepId::ValhallaPackage => in_area(format!("{area}.vtiles")),
         // planetiler names its downloads with underscores
         StepId::DownloadOsm => {

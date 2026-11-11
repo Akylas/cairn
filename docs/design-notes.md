@@ -313,8 +313,7 @@ relocation, codesign, notarize. First-run flow downloads JRE, planetiler jar, el
 ## Out of scope
 
 - Windows (Valhalla support is poor)
-- contours (superseded by terrain RGB)
-- tippecanoe (was contours-only)
+- tippecanoe (was contours-only; contours are now traced natively, see `crates/core/src/contours`)
 - prime_server (avoided by embedding `libvalhalla`)
 
 ## Repo issues to fix along the way

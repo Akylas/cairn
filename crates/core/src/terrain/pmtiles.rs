@@ -346,6 +346,11 @@ impl Archive {
         self.range(offset, length).map(Some)
     }
 
+    /// Whether the archive has this tile, from its directories alone - nothing is read.
+    pub fn contains(&self, z: u8, x: u32, y: u32) -> Result<bool> {
+        Ok(self.locate(z, x, y)?.is_some())
+    }
+
     /// Every tile the archive addresses, as `(zoom, tiles, bytes)` per zoom.
     ///
     /// Read from the directories alone - no tile is touched. A run of identical tiles counts once

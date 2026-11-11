@@ -38,6 +38,7 @@ The outputs are ordinary MBTiles, PMTiles and a Valhalla tar, so they work just 
 | `${AREA}.mbtiles` | [OpenMapTiles](https://openmaptiles.org)-schema vector basemap, z0–14 |
 | `${AREA}_routes.mbtiles` | hiking and cycling route relations, kept in their own archive |
 | `${AREA}_terrain.mbtiles` | terrain-RGB elevation, for shaded relief and 3D |
+| `${AREA}_contours.mbtiles` | contour lines as vector tiles, z11–14, every 10 m |
 | `${AREA}.vtiles` | the Valhalla routing package, with elevation baked in |
 
 ## Highlights
@@ -47,7 +48,7 @@ The outputs are ordinary MBTiles, PMTiles and a Valhalla tar, so they work just 
 * **Every option documented, with its cost.** `cairn options basemap` lists each flag with what it does to
   the archive's size. Defaults are the measured set: **−11.7 %** on the basemap and **−19.4 %** on routes
   against planetiler's own defaults, for rhone-alpes.
-* **Native where it counts.** The terrain-RGB renderer and the Valhalla packager are Rust, with no GDAL or
+* **Native where it counts.** The terrain-RGB renderer, the contour tracer and the Valhalla packager are Rust, with no GDAL or
   PROJ. Routing runs in-process against the package you just built — no `valhalla_service`, no zmq.
 * **Look at what you built.** A map view inspects, routes, profiles elevation, dumps raw tile contents (MVT or
   MLT), restyles an archive live and compares two builds side by side.
@@ -77,13 +78,14 @@ cairn basemap  --area $AREA          # vector basemap
 cairn routes   --area $AREA          # route relations
 cairn elevation --area $AREA         # .hgt tiles
 cairn terrain  --area $AREA          # terrain-RGB
+cairn contours --area $AREA          # contour lines
 cairn valhalla-admins --area $AREA   # country boundaries for the graph (optional, once)
 cairn valhalla-tiles --area $AREA    # routing graph
 cairn valhalla-package --area $AREA  # Valhalla package
 ```
 
 Every step clips to the area's own boundary, downloading the `.poly` from Geofabrik the first time it needs
-it. To clip to something else, pass a polygon: `--polygon` (basemap, routes), `--poly-shape` (terrain) or
+it. To clip to something else, pass a polygon: `--polygon` (basemap, routes), `--poly-shape` (terrain, contours) or
 `--poly` (package). [`examples/areas/`](examples/areas/) has two to start from.
 
 `cairn state --area $AREA` reports which outputs exist; `cairn state --area $AREA clear <step>` removes one.

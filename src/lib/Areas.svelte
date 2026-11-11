@@ -42,7 +42,7 @@
   /// Output is a flat list of files whose names carry the meaning, which reads as noise once an
   /// area has a dozen of them. Group by kind so the eye lands on "Basemap" rather than parsing
   /// `rhone-alpes_terrain.mbtiles.old` to work out what it is.
-  const KIND_ORDER = ["basemap", "routes", "terrain_rgb", "hillshade", "valhalla_package", "unknown"];
+  const KIND_ORDER = ["basemap", "routes", "terrain_rgb", "contours", "hillshade", "valhalla_package", "unknown"];
 
   /// One 16px glyph per kind, drawn with currentColor so it takes the accent from the section
   /// heading. Stroked rather than filled: at this size a filled glyph reads as a blob.
@@ -54,6 +54,8 @@
     // peaks
     terrain_rgb: "M1.6 12.8 6 5.2l2.6 4.4M6.6 12.8h7.8L10.6 6.4l-2 3.2",
     hillshade: "M1.6 12.8 6 5.2l2.6 4.4M6.6 12.8h7.8L10.6 6.4l-2 3.2",
+    // three nested rings, as on a map
+    contours: "M2 11.4c1.6-.2 2-2.8 4-3.2s3.4 1.6 5.2.8 2.2-3.4 2.8-4M2 14c2.6-.2 3.4-3.4 6.2-3.8s4 1.8 5.8.8M3.4 8.6C4.8 8 5.6 5.6 7.6 5.2s2.6 1.2 3.6.4",
     // a navigation arrow
     valhalla_package: "M14 2.4 2 7.2l4.8 2 2 4.8L14 2.4Z",
     unknown: "M9.2 1.8H4a1.4 1.4 0 0 0-1.4 1.4v9.6A1.4 1.4 0 0 0 4 14.2h8a1.4 1.4 0 0 0 1.4-1.4V6l-4.2-4.2Zm0 0V6h4.2",

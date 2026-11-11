@@ -4,8 +4,8 @@
 //! container from the extension through `TileArchiveConfig`, tippecanoe through
 //! `pmtiles_has_suffix`. Naming the output is the whole of the work.
 //!
-//! Terrain is the exception, because it writes its own archive rather than handing tiles to a
-//! tool - so it needs a second writer, which is `terrain::archive`. It is in this list because
+//! Terrain and contours are the exceptions, because they write their own archive rather than
+//! handing tiles to a tool - so they need a second writer, which is `terrain::archive`. It is in this list because
 //! it has one, not because a name is enough.
 //!
 //! A step that has neither keeps its own extension whatever is asked. Producing an mbtiles
@@ -52,7 +52,10 @@ impl ArchiveFormat {
 
 /// Whether the step's underlying tool can write PMTiles.
 pub fn supports_pmtiles(step: StepId) -> bool {
-    matches!(step, StepId::Basemap | StepId::Routes | StepId::Bathymap | StepId::TerrainRgb)
+    matches!(
+        step,
+        StepId::Basemap | StepId::Routes | StepId::Bathymap | StepId::TerrainRgb | StepId::Contours
+    )
 }
 
 /// The file name a tile step writes, for one area and one format.
@@ -61,6 +64,7 @@ pub fn archive_name(area: &str, step: StepId, format: ArchiveFormat) -> Option<S
         StepId::Basemap => "",
         StepId::Routes => "_routes",
         StepId::TerrainRgb => "_terrain",
+        StepId::Contours => "_contours",
         StepId::Bathymap => "_bathymap",
         _ => return None,
     };

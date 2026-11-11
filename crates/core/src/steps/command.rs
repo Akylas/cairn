@@ -32,7 +32,9 @@ enum Style {
 fn style(step: StepId) -> Style {
     match step {
         StepId::Basemap | StepId::Routes => Style::Overrides,
-        StepId::TerrainRgb | StepId::ValhallaPackage | StepId::Bathymap => Style::Flags,
+        StepId::TerrainRgb | StepId::Contours | StepId::ValhallaPackage | StepId::Bathymap => {
+            Style::Flags
+        }
         StepId::DownloadOsm
         | StepId::ElevationTiles
         | StepId::ValhallaAdmins
@@ -71,13 +73,13 @@ pub fn argv(
             }
         }
         Style::Flags => {
-            if step == StepId::TerrainRgb {
+            if reads_sources(step) {
                 terrain_paths(settings, &mut out);
             }
             for def in &defs {
                 flag(step, def, values.get(&def.key), &mut out);
             }
-            if step == StepId::TerrainRgb {
+            if reads_sources(step) {
                 // The form leaves this off and the command line leaves it on, so the line says
                 // which one the run used rather than leaving it to the default.
                 let on = values.get("area_poly").and_then(Value::as_bool).unwrap_or(false);
@@ -133,6 +135,11 @@ fn planetiler_paths(settings: &Settings, out: &mut Vec<String>) {
     }
 }
 
+/// The steps that sample the elevation sources, and so take the same source and clip flags.
+fn reads_sources(step: StepId) -> bool {
+    matches!(step, StepId::TerrainRgb | StepId::Contours)
+}
+
 fn terrain_paths(settings: &Settings, out: &mut Vec<String>) {
     let defaults = Settings::for_repo(settings.repo_root.clone());
     let differs = |a: &Path, b: &Path| a != b;
@@ -169,7 +176,7 @@ fn flag(step: StepId, def: &OptionDef, value: Option<&Value>, out: &mut Vec<Stri
         }
         return;
     }
-    if step == StepId::TerrainRgb {
+    if reads_sources(step) {
         match def.key.as_str() {
             // written out separately, always, after the others
             "area_poly" => return,

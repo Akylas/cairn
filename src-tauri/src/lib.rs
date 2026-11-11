@@ -538,39 +538,46 @@ fn step_options(step: StepId) -> Vec<OptionDef> {
     options::for_step(step)
 }
 
+/// Where a terrain or contour build writes. `step` is terrain unless it says otherwise: the two
+/// share a writer, and so a way of resuming.
 fn terrain_output(
     settings: &Settings,
     area: &str,
     pmtiles: bool,
+    step: Option<StepId>,
 ) -> Result<(PathBuf, ArchiveFormat), String> {
     let format = if pmtiles { ArchiveFormat::PMTiles } else { ArchiveFormat::MBTiles };
-    let name = archive::archive_name(area, StepId::TerrainRgb, format)
-        .ok_or("terrain has an archive name")?;
+    let step = step.unwrap_or(StepId::TerrainRgb);
+    let name = archive::archive_name(area, step, format)
+        .filter(|_| matches!(step, StepId::TerrainRgb | StepId::Contours))
+        .ok_or("only terrain and contours have a build to resume")?;
     Ok((settings.area_dir(area).join(name), format))
 }
 
-/// What an interrupted terrain build has already written, so the Build view can say that the next
-/// run continues it.
+/// What an interrupted terrain or contour build has already written, so the Build view can say
+/// that the next run continues it.
 #[tauri::command]
 async fn terrain_partial(
     config: State<'_, Config>,
     area: String,
     pmtiles: bool,
+    step: Option<StepId>,
 ) -> Result<Option<PartialInfo>, String> {
-    let (path, format) = terrain_output(&config.get()?, &area, pmtiles)?;
+    let (path, format) = terrain_output(&config.get()?, &area, pmtiles, step)?;
     tokio::task::spawn_blocking(move || TerrainArchive::partial_info(&path, format))
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Throw an interrupted terrain build away.
+/// Throw an interrupted terrain or contour build away.
 #[tauri::command]
 async fn terrain_discard_partial(
     config: State<'_, Config>,
     area: String,
     pmtiles: bool,
+    step: Option<StepId>,
 ) -> Result<(), String> {
-    let (path, format) = terrain_output(&config.get()?, &area, pmtiles)?;
+    let (path, format) = terrain_output(&config.get()?, &area, pmtiles, step)?;
     tokio::task::spawn_blocking(move || TerrainArchive::discard_partial(&path, format))
         .await
         .map_err(|e| e.to_string())?
@@ -1272,7 +1279,11 @@ async fn run_steps(
             .await;
         // `area_poly` is cairn's own switch: resolve it to a real clip path, fetching the
         // boundary from Geofabrik on the first build that asks for it.
-        let clip_key = if step == StepId::TerrainRgb { "poly_shape" } else { "polygon" };
+        let clip_key = if matches!(step, StepId::TerrainRgb | StepId::Contours) {
+            "poly_shape"
+        } else {
+            "polygon"
+        };
         if let Err(e) = cairn_core::steps::download::apply_area_poly(
             &mut values,
             clip_key,
@@ -1382,6 +1393,18 @@ async fn run_steps(
             }
             StepId::TerrainRgb => {
                 run_terrain(
+                    &settings,
+                    &req.area,
+                    step,
+                    &values,
+                    tx.clone(),
+                    &cancel,
+                    locks.get("elevation"),
+                )
+                .await
+            }
+            StepId::Contours => {
+                run_contours(
                     &settings,
                     &req.area,
                     step,
@@ -1959,38 +1982,7 @@ async fn run_terrain(
         values.get("download_elevation").and_then(|v| v.as_bool()).unwrap_or(true);
     let as_png = text("format").as_deref() == Some("png");
 
-    // bounds come from the area's basemap when there is one, so terrain matches its extent
-    let bounds = catalog::discover(&settings.output_root)
-        .ok()
-        .and_then(|areas| {
-            areas
-                .into_iter()
-                .find(|a| a.name == area)?
-                .artifacts
-                .iter()
-                .find(|a| a.kind == catalog::ArtifactKind::Basemap)?
-                .bounds
-                .clone()
-        })
-        .and_then(|b| {
-            let p: Vec<f64> = b.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-            (p.len() == 4).then(|| (p[0], p[1], p[2], p[3]))
-        })
-        .ok_or("no basemap bounds to derive the terrain extent from");
-    // an explicit box wins, then the shape's own bounds, then the area's basemap
-    let bounds = match text("bounds") {
-        Some(raw) => {
-            let p: Vec<f64> = raw.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-            if p.len() != 4 {
-                return Err("bounds want west,south,east,north".into());
-            }
-            (p[0], p[1], p[2], p[3])
-        }
-        None => match &shape {
-            Some(shape) => shape.bounds(),
-            None => bounds?,
-        },
-    };
+    let bounds = sampling_bounds(settings, area, values, shape.as_ref())?;
 
     // A source list that names no .hgt source wants none of them: downloading 25 MB a degree for
     // a render that will never open them is pure waste. When the list cannot be read at all the
@@ -2005,30 +1997,9 @@ async fn run_terrain(
         let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
             return Ok(cancelled(&tx, step).await);
         };
-        let progress = tx.clone();
-        let (got, total) = cairn_core::steps::elevation::ensure_cancellable(
-            &settings.elevation_tiles_dir,
-            bounds,
-            cancel,
-            |done, total| {
-                let _ = progress.try_send(StepEvent::Progress {
-                    step,
-                    label: "elevation".into(),
-                    percent: ((done * 100) / total.max(1)).min(100) as u8,
-                });
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        if cancel.is_cancelled() {
+        if !fetch_elevation(settings, bounds, step, &tx, cancel).await? {
             return Ok(cancelled(&tx, step).await);
         }
-        let _ = tx
-            .send(StepEvent::Log {
-                step,
-                line: format!("elevation: {got} downloaded of {total} covering tiles"),
-            })
-            .await;
     }
 
     let name = format!("{area}_terrain");
@@ -2084,6 +2055,217 @@ async fn run_terrain(
         })
         .map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if !outcome.finished {
+        let _ = tx
+            .send(StepEvent::Log {
+                step,
+                line: format!(
+                    "stopped with {} tiles written; run it again to continue from here, or tick \
+                     \"Start over\" to discard them",
+                    outcome.written
+                ),
+            })
+            .await;
+        return Ok(cancelled(&tx, step).await);
+    }
+    let _ = tx.send(StepEvent::Finished { step, ok: true, elapsed: None, outputs: vec![] }).await;
+    Ok(true)
+}
+
+/// The box a step that samples elevation covers: an explicit `bounds`, else the clip shape's, else
+/// the area's basemap's - so terrain and contours line up with the vector tiles.
+fn sampling_bounds(
+    settings: &Settings,
+    area: &str,
+    values: &BTreeMap<String, serde_json::Value>,
+    shape: Option<&cairn_core::poly::Polygon>,
+) -> Result<(f64, f64, f64, f64), String> {
+    let parse = |raw: &str| -> Option<(f64, f64, f64, f64)> {
+        let p: Vec<f64> = raw.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        (p.len() == 4).then(|| (p[0], p[1], p[2], p[3]))
+    };
+    if let Some(raw) = values.get("bounds").and_then(|v| v.as_str()) {
+        return parse(raw).ok_or_else(|| "bounds want west,south,east,north".to_string());
+    }
+    if let Some(shape) = shape {
+        return Ok(shape.bounds());
+    }
+    catalog::discover(&settings.output_root)
+        .ok()
+        .and_then(|areas| {
+            areas
+                .into_iter()
+                .find(|a| a.name == area)?
+                .artifacts
+                .iter()
+                .find(|a| a.kind == catalog::ArtifactKind::Basemap)?
+                .bounds
+                .clone()
+        })
+        .and_then(|b| parse(&b))
+        .ok_or_else(|| "no basemap bounds to derive the extent from".to_string())
+}
+
+/// Download the `.hgt` tiles under `bounds` that are not already there. `Ok(false)` when the run
+/// was cancelled meanwhile. The caller holds the machine-wide elevation lock.
+async fn fetch_elevation(
+    settings: &Settings,
+    bounds: (f64, f64, f64, f64),
+    step: StepId,
+    tx: &mpsc::Sender<StepEvent>,
+    cancel: &Cancel,
+) -> Result<bool, String> {
+    let progress = tx.clone();
+    let (got, total) = cairn_core::steps::elevation::ensure_cancellable(
+        &settings.elevation_tiles_dir,
+        bounds,
+        cancel,
+        |done, total| {
+            let _ = progress.try_send(StepEvent::Progress {
+                step,
+                label: "elevation".into(),
+                percent: ((done * 100) / total.max(1)).min(100) as u8,
+            });
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if cancel.is_cancelled() {
+        return Ok(false);
+    }
+    let _ = tx
+        .send(StepEvent::Log {
+            step,
+            line: format!("elevation: {got} downloaded of {total} covering tiles"),
+        })
+        .await;
+    Ok(true)
+}
+
+/// The elevation sources a build reads: `sources.json`, or the bare `.hgt` directory when there is
+/// none.
+fn elevation_specs(
+    sources_json: &Path,
+    hgt_dir: &Path,
+) -> Vec<cairn_core::terrain::source::SourceSpec> {
+    cairn_core::terrain::source::read_specs(sources_json).unwrap_or_else(|_| {
+        vec![cairn_core::terrain::source::SourceSpec {
+            name: "elevation_tiles".into(),
+            kind: "valhalla".into(),
+            path: hgt_dir.to_path_buf(),
+            clamp_min: Some(-10.0),
+            download: None,
+            ..Default::default()
+        }]
+    })
+}
+
+/// Trace contour lines into vector tiles.
+///
+/// The contour twin of [`run_terrain`]: the same sources, the same boundary, the same resumable
+/// archive, and a render loop of its own in `cairn_core::contours`.
+async fn run_contours(
+    settings: &Settings,
+    area: &str,
+    step: StepId,
+    values: &BTreeMap<String, serde_json::Value>,
+    tx: mpsc::Sender<StepEvent>,
+    cancel: &Cancel,
+    elevation_lock: Arc<tokio::sync::Mutex<()>>,
+) -> Result<bool, String> {
+    use cairn_core::contours::{build, tileset, ContourOptions};
+    use cairn_core::terrain::source;
+
+    let _ = tx.send(StepEvent::Started { step, area: area.to_string() }).await;
+
+    let sources_json = settings.sources_json.clone();
+    let hgt_dir = settings.elevation_tiles_dir.clone();
+    let archive_format = ArchiveFormat::from_values(values);
+    let output = settings.area_dir(area).join(
+        archive::archive_name(area, step, archive_format).expect("contours has an archive name"),
+    );
+    let text = |key: &str| {
+        values.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty())
+    };
+    let flag =
+        |key: &str, default: bool| values.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+
+    let opts = ContourOptions::from_values(values).map_err(|e| e.to_string())?;
+    let shape = match text("poly_shape") {
+        Some(path) => Some(
+            cairn_core::poly::Polygon::parse(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+    let poly_file = text("poly_shape").map(std::path::PathBuf::from);
+    let bounds = sampling_bounds(settings, area, values, shape.as_ref())?;
+    let name = text("name").map(str::to_string).unwrap_or_else(|| format!("{area}_contours"));
+
+    let basemap = if flag("match_basemap", false) {
+        let found = tileset::basemap_path(&settings.area_dir(area), area);
+        if found.is_none() {
+            let _ = tx
+                .send(StepEvent::Log {
+                    step,
+                    line: format!("no basemap for {area} yet, so every tile is kept"),
+                })
+                .await;
+        }
+        found
+    } else {
+        None
+    };
+
+    let wants_hgt = source::read_specs(&sources_json)
+        .map(|specs| specs.iter().any(|s| source::is_hgt(&s.kind)))
+        .unwrap_or(true);
+    if flag("download_elevation", true) && wants_hgt {
+        let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
+            return Ok(cancelled(&tx, step).await);
+        };
+        if !fetch_elevation(settings, bounds, step, &tx, cancel).await? {
+            return Ok(cancelled(&tx, step).await);
+        }
+    }
+
+    let progress = tx.clone();
+    // checked between batches, like the terrain render: a build stopped there keeps what it
+    // wrote, and the next run continues it
+    let stop = cancel.clone();
+    let mode = if flag("fresh", false) { ResumeMode::Fresh } else { ResumeMode::Auto };
+    let outcome = tokio::task::spawn_blocking(
+        move || -> Result<cairn_core::terrain::build::Outcome, String> {
+            let specs = elevation_specs(&sources_json, &hgt_dir);
+            let job = build::Job {
+                specs: &specs,
+                opts: &opts,
+                bounds,
+                shape: shape.as_ref(),
+                shape_file: poly_file.as_deref(),
+                only_tiles_of: basemap.as_deref(),
+                archive_format,
+                output: &output,
+                name: &name,
+                mode,
+                batch: cairn_core::terrain::build::BATCH,
+            };
+            build::run(&job, &|| stop.is_cancelled(), &mut |event| {
+                use cairn_core::terrain::build::Event;
+                let _ = match event {
+                    Event::Log(line) => progress.blocking_send(StepEvent::Log { step, line }),
+                    Event::Phase(name) => progress.blocking_send(StepEvent::Phase { step, name }),
+                    Event::Progress { label, percent } => {
+                        progress.blocking_send(StepEvent::Progress { step, label, percent })
+                    }
+                };
+            })
+            .map_err(|e| format!("{e:#}"))
+        },
+    )
     .await
     .map_err(|e| e.to_string())??;
 

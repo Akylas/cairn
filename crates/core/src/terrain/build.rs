@@ -39,10 +39,10 @@ pub const BATCH: usize = 256;
 pub const RENDER_REVISION: u32 = 2;
 
 /// How often the build says what it is doing.
-const REPORT_EVERY: Duration = Duration::from_secs(10);
+pub(crate) const REPORT_EVERY: Duration = Duration::from_secs(10);
 
 /// Requests to a remote tile source after which a bulk read of an archive is the kinder way.
-const MANY_REQUESTS: u64 = 50_000;
+pub(crate) const MANY_REQUESTS: u64 = 50_000;
 
 pub struct Job<'a> {
     pub specs: &'a [SourceSpec],
@@ -161,7 +161,7 @@ pub fn wanted_tiles(job: &Job, zoom: u8) -> Vec<(u32, u32)> {
         .collect()
 }
 
-fn fingerprint(tiles: &[(u32, u32)]) -> u64 {
+pub(crate) fn fingerprint(tiles: &[(u32, u32)]) -> u64 {
     let mut hash = FNV_OFFSET;
     for (x, y) in tiles {
         hash = fnv1a(hash, &x.to_le_bytes());
@@ -171,17 +171,17 @@ fn fingerprint(tiles: &[(u32, u32)]) -> u64 {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Snapshot {
-    requests: u64,
-    not_found: u64,
-    fetch_ms: u64,
-    retries: u64,
-    failures: u64,
-    from_disk: u64,
-    decoded: u64,
+pub(crate) struct Snapshot {
+    pub requests: u64,
+    pub not_found: u64,
+    pub fetch_ms: u64,
+    pub retries: u64,
+    pub failures: u64,
+    pub from_disk: u64,
+    pub decoded: u64,
 }
 
-fn snapshot(counters: &[(String, Arc<Counters>)]) -> (Snapshot, u64) {
+pub(crate) fn snapshot(counters: &[(String, Arc<Counters>)]) -> (Snapshot, u64) {
     let mut sum = Snapshot::default();
     let mut in_flight = 0;
     for (_, c) in counters {
@@ -199,15 +199,15 @@ fn snapshot(counters: &[(String, Arc<Counters>)]) -> (Snapshot, u64) {
 
 /// Where the time of the batches since the last report went, in milliseconds.
 #[derive(Default)]
-struct Spent {
-    batches: u64,
-    tiles: u64,
-    render: u64,
-    waiting: u64,
-    archive: u64,
+pub(crate) struct Spent {
+    pub batches: u64,
+    pub tiles: u64,
+    pub render: u64,
+    pub waiting: u64,
+    pub archive: u64,
 }
 
-fn ms(since: Instant) -> u64 {
+pub(crate) fn ms(since: Instant) -> u64 {
     since.elapsed().as_millis() as u64
 }
 
@@ -399,7 +399,7 @@ fn stopped(pool: &RenderPool, written: u64) -> Outcome {
 
 /// What every worker's copy of each source did, added up - each of them holds its own, and
 /// eighteen lines of half a story is worse than one line of the whole one.
-fn totals(pool: &RenderPool) -> Vec<(String, TileStats)> {
+pub(crate) fn totals(pool: &RenderPool) -> Vec<(String, TileStats)> {
     let mut out: Vec<(String, TileStats)> = Vec::new();
     for source in pool.all_sources() {
         let Ok(source) = source.lock() else { continue };
@@ -414,7 +414,7 @@ fn totals(pool: &RenderPool) -> Vec<(String, TileStats)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn report(
+pub(crate) fn report(
     zoom: u8,
     percent: u8,
     elapsed: Duration,
