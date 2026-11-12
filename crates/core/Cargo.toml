@@ -29,7 +29,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 pmtiles = { version = "0.24.0", default-features = false, features = ["write"] }
 webp = { version = "0.3", default-features = false }
-libwebp-sys = "0.9"
+libwebp-sys = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
