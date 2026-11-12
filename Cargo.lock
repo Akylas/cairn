@@ -516,7 +516,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "image",
- "libwebp-sys",
+ "libwebp-sys 0.14.4",
  "pmtiles",
  "rayon",
  "regex",
@@ -2409,6 +2409,17 @@ checksum = "54cd30df7c7165ce74a456e4ca9732c603e8dc5e60784558c1c6dc047f876733"
 dependencies = [
  "cc",
  "glob",
+]
+
+[[package]]
+name = "libwebp-sys"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b3a87b44e34d17161e4f17d92a463d596cb13825dcd1758ed18fd3a721e189c"
+dependencies = [
+ "cc",
+ "glob",
+ "pkg-config",
 ]
 
 [[package]]
@@ -5260,7 +5271,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c071456adef4aca59bf6a583c46b90ff5eb0b4f758fc347cea81290288f37ce1"
 dependencies = [
- "libwebp-sys",
+ "libwebp-sys 0.9.6",
 ]
 
 [[package]]
