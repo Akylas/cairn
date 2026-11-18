@@ -332,3 +332,78 @@ Then build valhalla "mbtiles package
 ```shell
 python ./tools/legacy/scripts/build_valhalla_package.py --id $AREA --poly $AREA.poly --polymaxzoom=11 valhalla_tiles ${OUTPUT_DIR}/${AREA}/${AREA}.vtiles
 ```
+
+## Elevation for the Valhalla graph
+
+`valhalla_build_tiles` bakes road grades in from elevation it reads while it builds, and the only format
+its sampler reads is 1° `.hgt` files - 26 MB each, over a hundred gigabytes for Europe. By default cairn does
+not keep them: the build runs a small server on the loopback interface for as long as it lasts, and
+`valhalla.json` (a copy, written under `data/tmp/<area>/`; yours is not touched) points Valhalla at it.
+Each degree square it asks for is rendered from the terrain sources in `sources.json`, so the graph and the
+terrain are made from the same ground, and nothing is written to `elevation_tiles/`.
+
+```shell
+cairn valhalla-tiles --area $AREA                       # elevation from sources.json
+cairn valhalla-tiles --area $AREA --elevation-from hgt  # the .hgt files, as before
+```
+
+The same choice is *Routing elevation* in Settings. With the default, `cairn elevation` has nothing to
+download and says so - unless a source in `sources.json` is itself a directory of `.hgt` files.
+
+A degree square takes about a second to render the first time, and Valhalla keeps the ones it has fetched, so
+the cost is one pass over the area. The grid is 1 arcsecond (about 30 m) whatever the source holds;
+Valhalla resamples a road's shape every 60 m before looking anything up, so the finer source detail is for
+the terrain, not the graph. This needs the Valhalla fork's `elevation_url_store` option; with an older build
+the graph is still right, but each square is also written under `data/tmp/<area>/elevation/` until the
+build ends.
+
+### One mapterhorn file, grown as you build
+
+A local `pmtiles` source reads a file on disk and keeps no per-tile cache. Give it `extract_from` and
+cairn builds that file for you. mapterhorn is published as two things, and the list names both:
+
+```json
+{"name": "mapterhorn", "type": "pmtiles", "path": "../data/sources/mapterhorn.pmtiles",
+ "extract_from": ["https://download.mapterhorn.com/planet.pmtiles",
+                  "https://download.mapterhorn.com/6-{x}-{y}.pmtiles"],
+ "encoding": "terrarium", "maxzoom": 15, "clamp_min": -10}
+```
+
+`planet.pmtiles` holds z0-12 for the world. Everything finer is in one archive per z6 tile of the world
+(`6-33-23.pmtiles`, z13 to z17 or 18, each hundreds of gigabytes), which is what the `{x}` and `{y}`
+template stands for: only the ones an area touches are opened, and one that does not exist is an empty
+region. A single URL may be written as a string rather than a list.
+
+Before terrain, contours or the Valhalla graph read their sources - and in the app as the *Elevation
+tiles* step - the file is grown to cover the area: the tiles the area needs (its box to a tenth of a
+degree, or its outline when it has one, plus a ring of one tile) and the file lacks are fetched from the
+archive that holds them by byte range, and the file is rewritten as the union of what it had and what it
+has now. Nearby tiles are fetched as one request, and the sea, which the archives do not have, costs none.
+
+Each step asks only for the zoom it reads: the graph and the elevation step stop at z12, terrain and
+contours at the zoom they render. So a graph build never downloads z15, and a terrain build to z13 adds
+z13 to a file that stopped at z12, keeping everything in it.
+
+What a zoom costs, from the tiles in the Alps (about 80 KB at z13, 100 KB at z14, 110 KB at z15, and four
+times as many tiles for each zoom): an area of 40,000 km² is roughly 0.3 GB at z13, 1.5 GB at z14 and
+7 GB at z15, and a continent is a hundred times that. Set `maxzoom` to what you will render.
+
+`rhone-alpes`, then `france`, then `europe` is one file that grows, never three. An area it already covers
+costs nothing and makes no request at all (`mapterhorn.pmtiles.coverage.json` beside it remembers what it
+covers). Growing it writes a second file next to it and moves that into place at the end, so it needs
+room for both for a while, and an interrupted or cancelled run leaves the old one as it was and continues
+from its last finished batch.
+
+`--no-elevation-download` (and *download elevation* in the app) turns the growing off. One run at a time
+may grow a given file.
+
+An extract made by hand works too, and is the choice when you want every area at once and a known size
+up front:
+
+```shell
+pmtiles extract --dry-run --bbox=-12,34,45,72 https://download.mapterhorn.com/planet.pmtiles
+pmtiles extract --bbox=-12,34,45,72 https://download.mapterhorn.com/planet.pmtiles data/sources/mapterhorn.pmtiles
+```
+
+A hand-made extract of the planet archive stops at z12; for anything finer cut the regional `6-x-y.pmtiles`
+files the same way.

@@ -66,7 +66,8 @@ pub struct Args {
     /// Elevation written where no source covers a pixel. build_terrain_rgb.py used -10.
     #[arg(long, default_value_t = 0.0)]
     pub nodata_elevation: f64,
-    /// Do not fetch missing .hgt tiles; render only what is already on disk.
+    /// Do not fetch anything: no missing .hgt tiles, and no growing of a source built from a remote
+    /// archive. Render only what is already on disk.
     #[arg(long)]
     pub no_elevation_download: bool,
     /// Stop if the output is already there, instead of replacing it.
@@ -149,6 +150,42 @@ pub(crate) fn load_specs(
     Ok((specs, sources_path, hgt_dir))
 }
 
+/// Grow the sources that are built from a remote archive so that they cover `bounds`, saying so as
+/// it goes. Nothing happens, and nothing is printed, when none of them is.
+pub(crate) async fn grow_sources(
+    settings: &Settings,
+    sources: &std::path::Path,
+    bounds: (f64, f64, f64, f64),
+    shape: Option<&cairn_core::poly::Polygon>,
+    zoom_cap: Option<u8>,
+) -> Result<()> {
+    use cairn_core::terrain::build::Event;
+    use std::io::Write;
+
+    let mut settings = settings.clone();
+    settings.sources_json = sources.to_path_buf();
+    let outcome = cairn_core::steps::extract_sources::ensure(
+        &settings,
+        bounds,
+        shape.cloned(),
+        zoom_cap,
+        &cairn_core::cancel::Cancel::never(),
+        |event| match event {
+            Event::Log(line) => println!("\r  {line}"),
+            Event::Phase(name) => println!("[{name}]"),
+            Event::Progress { percent, .. } => {
+                print!("\r  extract {percent}%   ");
+                let _ = std::io::stdout().flush();
+            }
+        },
+    )
+    .await?;
+    for line in outcome.lines() {
+        println!("\r  {line}");
+    }
+    Ok(())
+}
+
 /// The bounds of the area's basemap, which keep an output's coverage identical to the vector tiles.
 pub(crate) fn basemap_bounds(settings: &Settings, area: &str) -> Result<(f64, f64, f64, f64)> {
     cairn_core::catalog::discover(&settings.output_root)?
@@ -185,6 +222,22 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
     let suffix = "terrain";
     let (specs, sources_path, hgt_dir) =
         load_specs(settings, args.sources.clone(), args.elevation_dir.clone())?;
+    // the basemap's bounds keep terrain and vector coverage identical
+    // the shape, when given, is both the clip and the default extent
+    let shape =
+        args.poly_shape.as_ref().map(|p| cairn_core::poly::Polygon::parse(p)).transpose()?;
+
+    let bounds = match (&args.bounds, &shape) {
+        (Some(raw), _) => parse_bounds(raw)?,
+        (None, Some(shape)) => shape.bounds(),
+        (None, None) => basemap_bounds(settings, &args.area)?,
+    };
+
+    // a source built from a remote archive is grown to cover this area before it is opened, so a
+    // clean checkout can build from nothing
+    if !args.dry_run && !args.no_elevation_download {
+        grow_sources(settings, &sources_path, bounds, shape.as_ref(), Some(args.maxzoom)).await?;
+    }
     let (composite, skipped) = source::CompositeSource::open(&specs)?;
     if args.dry_run {
         println!("sources, highest priority first: {:?}", composite.names());
@@ -196,17 +249,6 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
         return Err(anyhow!("no usable elevation sources in {}", sources_path.display()));
     }
     drop(composite);
-
-    // the basemap's bounds keep terrain and vector coverage identical
-    // the shape, when given, is both the clip and the default extent
-    let shape =
-        args.poly_shape.as_ref().map(|p| cairn_core::poly::Polygon::parse(p)).transpose()?;
-
-    let bounds = match (&args.bounds, &shape) {
-        (Some(raw), _) => parse_bounds(raw)?,
-        (None, Some(shape)) => shape.bounds(),
-        (None, None) => basemap_bounds(settings, &args.area)?,
-    };
 
     let opts = render::TerrainOptions {
         encoding,

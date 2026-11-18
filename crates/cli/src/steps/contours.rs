@@ -165,6 +165,24 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
 
     let (specs, sources_path, hgt_dir) =
         load_specs(settings, args.sources.clone(), args.elevation_dir.clone())?;
+    let shape =
+        args.poly_shape.as_ref().map(|p| cairn_core::poly::Polygon::parse(p)).transpose()?;
+    let bounds = match (&args.bounds, &shape) {
+        (Some(raw), _) => parse_bounds(raw)?,
+        (None, Some(shape)) => shape.bounds(),
+        (None, None) => basemap_bounds(settings, &args.area)?,
+    };
+
+    if !args.dry_run && !args.no_elevation_download {
+        super::terrain::grow_sources(
+            settings,
+            &sources_path,
+            bounds,
+            shape.as_ref(),
+            Some(opts.maxzoom),
+        )
+        .await?;
+    }
     let (composite, skipped) = source::CompositeSource::open(&specs)?;
     if args.dry_run {
         println!("sources, highest priority first: {:?}", composite.names());
@@ -176,14 +194,6 @@ pub async fn run(settings: &Settings, mut args: Args) -> Result<()> {
         return Err(anyhow!("no usable elevation sources in {}", sources_path.display()));
     }
     drop(composite);
-
-    let shape =
-        args.poly_shape.as_ref().map(|p| cairn_core::poly::Polygon::parse(p)).transpose()?;
-    let bounds = match (&args.bounds, &shape) {
-        (Some(raw), _) => parse_bounds(raw)?,
-        (None, Some(shape)) => shape.bounds(),
-        (None, None) => basemap_bounds(settings, &args.area)?,
-    };
 
     let archive_format = if args.pmtiles { ArchiveFormat::PMTiles } else { ArchiveFormat::MBTiles };
     let output = args.output.clone().unwrap_or_else(|| {
