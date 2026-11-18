@@ -12,6 +12,8 @@ node_modules/
 /dist
 /target
 
+/config
+
 # Bundled at package time by scripts/bundle_resources.sh - the jar, the CLI, valhalla.json and
 # the collected dylibs. Large, machine-specific, and rebuilt on every release.
 /src-tauri/resources/*

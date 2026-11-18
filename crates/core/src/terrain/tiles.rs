@@ -392,6 +392,55 @@ impl PmArchive {
     }
 }
 
+/// A PMTiles archive on a server, read by byte range, for a caller that wants to copy tiles out of
+/// it rather than sample them.
+pub(super) struct Upstream {
+    reader: Reader,
+    archive: PmArchive,
+    url: String,
+    fetcher: Arc<Fetcher>,
+}
+
+impl Upstream {
+    pub(super) fn open(url: &str) -> Result<Self> {
+        let counters = Arc::new(Counters::default());
+        let reader = Reader::open(&Location::Remote(url.to_string()), None, counters)?;
+        let Backing::Remote { fetcher, .. } = &reader.backing else {
+            return Err(anyhow!("`{url}` is not a remote archive"));
+        };
+        let fetcher = fetcher.clone();
+        let archive = PmArchive::open(&reader)?;
+        Ok(Self { reader, archive, url: url.to_string(), fetcher })
+    }
+
+    /// As [`Self::open`], but `None` when the server has no such archive: a regional archive that
+    /// does not exist is a region with nothing in it, not an error.
+    pub(super) fn open_optional(url: &str) -> Result<Option<Self>> {
+        let probe = Reader::open(&Location::Remote(url.to_string()), None, Arc::default())?;
+        if probe.range(0, pmtiles::HEADER_LEN as u64)?.is_none() {
+            return Ok(None);
+        }
+        Self::open(url).map(Some)
+    }
+
+    pub(super) fn header(&self) -> &Header {
+        &self.archive.header
+    }
+
+    /// Absolute `(offset, length)` of a tile, or `None` where the archive has none.
+    pub(super) fn locate(&mut self, z: u8, x: u32, y: u32) -> Result<Option<(u64, u64)>> {
+        self.archive.locate(&self.reader, z, x, y)
+    }
+
+    pub(super) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(super) fn fetcher(&self) -> &Fetcher {
+        &self.fetcher
+    }
+}
+
 enum Layout {
     /// A `{z}/{x}/{y}` URL template.
     Xyz,

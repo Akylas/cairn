@@ -68,7 +68,14 @@ pub fn outputs_for(
         StepId::DownloadOsm => {
             vec![settings.data_dir.join(format!("{}.osm.pbf", area.replace('-', "_")))]
         }
-        StepId::ElevationTiles => vec![settings.elevation_tiles_dir.clone()],
+        // the .hgt directory when something reads it, and the local copies of remote sources
+        StepId::ElevationTiles => {
+            let mut outputs = super::extract_sources::targets(settings);
+            if super::routing_elevation::hgt_needed(settings) {
+                outputs.push(settings.elevation_tiles_dir.clone());
+            }
+            outputs
+        }
         StepId::ValhallaAdmins => vec![super::admins::output_path(settings)],
         StepId::ValhallaTiles => vec![settings.repo_root.join("valhalla_tiles")],
     }

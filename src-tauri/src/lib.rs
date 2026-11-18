@@ -6,7 +6,7 @@ use cairn_core::cancel::Cancel;
 use cairn_core::catalog::{self, Area, TileStats};
 use cairn_core::elevation::{Profile, TerrainSampler};
 use cairn_core::presets::{Preset, PresetStore};
-use cairn_core::settings::Settings;
+use cairn_core::settings::{RoutingElevation, Settings};
 use cairn_core::steps::archive::{self, ArchiveFormat};
 use cairn_core::steps::options::{self, OptionDef};
 use cairn_core::steps::planetiler::{run_cancellable, PlanetilerJob, Schema};
@@ -1590,8 +1590,30 @@ async fn run_elevation(
     let step = StepId::ElevationTiles;
     let _ = tx.send(StepEvent::Started { step, area: area.to_string() }).await;
 
-    let bounds = area_bounds(settings, area)
-        .ok_or("no bounds for this area yet - build the basemap first, or set a polygon")?;
+    let bounds = cairn_core::steps::extract_sources::area_bounds(settings, area)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if !fetch_sources(
+        settings,
+        bounds,
+        cairn_core::steps::extract_sources::area_shape(settings, area),
+        Some(cairn_core::steps::extract_sources::ROUTING_MAXZOOM),
+        step,
+        &tx,
+        cancel,
+    )
+    .await?
+    {
+        return Ok(cancelled(&tx, step).await);
+    }
+    if !cairn_core::steps::routing_elevation::hgt_needed(settings) {
+        let line = "no .hgt tiles to download: nothing reads them".to_string();
+        let _ = tx.send(StepEvent::Log { step, line }).await;
+        let _ =
+            tx.send(StepEvent::Finished { step, ok: true, elapsed: None, outputs: vec![] }).await;
+        return Ok(true);
+    }
+
     let tiles = elevation::tiles_for_bounds(bounds);
     let _ = tx
         .send(StepEvent::Log {
@@ -1769,6 +1791,7 @@ async fn run_valhalla_tool(
     elevation_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<bool, String> {
     use cairn_core::steps::external::{self, ToolJob};
+    use cairn_core::steps::routing_elevation;
 
     let bin_dirs = settings.valhalla_bin_dirs();
     let config = settings.valhalla_config_path();
@@ -1780,15 +1803,63 @@ async fn run_valhalla_tool(
     if !pbf.is_file() {
         return Err(format!("{} is missing - run the OSM download step first", pbf.display()));
     }
-    let (name, args) = (
-        "valhalla_build_tiles",
-        vec!["-c".to_string(), config.display().to_string(), pbf.display().to_string()],
-    );
+    let name = "valhalla_build_tiles";
+    let program =
+        external::find_tool(bin_dirs.iter().map(|p| p.as_path()), name).ok_or_else(|| {
+            format!(
+                "{name} not found - looked in {}, and on PATH. Set the binary directory in \
+                 Settings.",
+                bin_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            )
+        })?;
 
-    // the graph bakes elevation in while it builds, reading the same .hgt directory the terrain
-    // step uses. Missing tiles are not an error there either - the graph just comes out with no
-    // grades - so they are fetched first.
-    if step == StepId::ValhallaTiles {
+    // The graph bakes elevation in while it builds. By default it is rendered from the terrain
+    // sources and served to Valhalla for the length of the build, so no .hgt copy is kept. A
+    // source built from a remote archive is grown to cover the area first.
+    if step == StepId::ValhallaTiles && settings.routing_elevation == RoutingElevation::Terrain {
+        let bounds = cairn_core::steps::extract_sources::area_bounds(settings, area)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
+            return Ok(cancelled(&tx, step).await);
+        };
+        if !fetch_sources(
+            settings,
+            bounds,
+            cairn_core::steps::extract_sources::area_shape(settings, area),
+            Some(cairn_core::steps::extract_sources::ROUTING_MAXZOOM),
+            step,
+            &tx,
+            cancel,
+        )
+        .await?
+        {
+            return Ok(cancelled(&tx, step).await);
+        }
+    }
+    let supply = if step == StepId::ValhallaTiles {
+        routing_elevation::prepare(settings, area, &config, settings.routing_elevation)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let config = match &supply {
+        Some(supply) => {
+            let line = format!(
+                "elevation: from the terrain sources in {}",
+                settings.sources_json.display()
+            );
+            let _ = tx.send(StepEvent::Log { step, line }).await;
+            supply.config.clone()
+        }
+        None => config,
+    };
+    let args = vec!["-c".to_string(), config.display().to_string(), pbf.display().to_string()];
+
+    // Otherwise it reads the .hgt directory the terrain step uses. Missing tiles are not an error
+    // there either - the graph just comes out with no grades - so they are fetched first.
+    if step == StepId::ValhallaTiles && supply.is_none() {
         if let Some(bounds) = area_bounds(settings, area) {
             let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
                 return Ok(cancelled(&tx, step).await);
@@ -1817,17 +1888,12 @@ async fn run_valhalla_tool(
         }
     }
     if cancel.is_cancelled() {
+        if let Some(supply) = supply {
+            supply.finish().await;
+        }
         return Ok(cancelled(&tx, step).await);
     }
 
-    let program =
-        external::find_tool(bin_dirs.iter().map(|p| p.as_path()), name).ok_or_else(|| {
-            format!(
-                "{name} not found - looked in {}, and on PATH. Set the binary directory in \
-                 Settings.",
-                bin_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-            )
-        })?;
     let job = ToolJob {
         step,
         area: area.to_string(),
@@ -1836,7 +1902,12 @@ async fn run_valhalla_tool(
         working_dir: settings.repo_root.clone(),
         parse: external::valhalla_line,
     };
-    external::run(job, tx, cancel.receiver()).await.map_err(|e| e.to_string())
+    let outcome = external::run(job, tx.clone(), cancel.receiver()).await;
+    if let Some(supply) = supply {
+        let line = routing_elevation::describe(supply.finish().await);
+        let _ = tx.send(StepEvent::Log { step, line }).await;
+    }
+    outcome.map_err(|e| e.to_string())
 }
 
 /// Build the boundary database the graph builder looks nodes up in.
@@ -1983,6 +2054,18 @@ async fn run_terrain(
     let as_png = text("format").as_deref() == Some("png");
 
     let bounds = sampling_bounds(settings, area, values, shape.as_ref())?;
+
+    // a source built from a remote archive is grown to cover this area first
+    if download_elevation {
+        let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
+            return Ok(cancelled(&tx, step).await);
+        };
+        if !fetch_sources(settings, bounds, shape.clone(), Some(opts.maxzoom), step, &tx, cancel)
+            .await?
+        {
+            return Ok(cancelled(&tx, step).await);
+        }
+    }
 
     // A source list that names no .hgt source wants none of them: downloading 25 MB a degree for
     // a render that will never open them is pure waste. When the list cannot be read at all the
@@ -2145,6 +2228,47 @@ async fn fetch_elevation(
     Ok(true)
 }
 
+/// Grow the local copies of remote elevation sources until they cover `bounds`, reporting as it
+/// goes. `Ok(false)` when the run was cancelled meanwhile; what was fetched is kept.
+///
+/// The caller holds the machine-wide elevation lock: two areas growing one file would each
+/// rewrite it from the other's old copy.
+async fn fetch_sources(
+    settings: &Settings,
+    bounds: (f64, f64, f64, f64),
+    shape: Option<cairn_core::poly::Polygon>,
+    zoom_cap: Option<u8>,
+    step: StepId,
+    tx: &mpsc::Sender<StepEvent>,
+    cancel: &Cancel,
+) -> Result<bool, String> {
+    use cairn_core::terrain::build::Event;
+
+    let events = tx.clone();
+    let outcome = cairn_core::steps::extract_sources::ensure(
+        settings,
+        bounds,
+        shape,
+        zoom_cap,
+        cancel,
+        move |event| {
+            let _ = match event {
+                Event::Log(line) => events.blocking_send(StepEvent::Log { step, line }),
+                Event::Phase(name) => events.blocking_send(StepEvent::Phase { step, name }),
+                Event::Progress { label, percent } => {
+                    events.blocking_send(StepEvent::Progress { step, label, percent })
+                }
+            };
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    for line in outcome.lines() {
+        let _ = tx.send(StepEvent::Log { step, line }).await;
+    }
+    Ok(!outcome.stopped && !cancel.is_cancelled())
+}
+
 /// The elevation sources a build reads: `sources.json`, or the bare `.hgt` directory when there is
 /// none.
 fn elevation_specs(
@@ -2223,6 +2347,16 @@ async fn run_contours(
     let wants_hgt = source::read_specs(&sources_json)
         .map(|specs| specs.iter().any(|s| source::is_hgt(&s.kind)))
         .unwrap_or(true);
+    if flag("download_elevation", true) {
+        let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
+            return Ok(cancelled(&tx, step).await);
+        };
+        if !fetch_sources(settings, bounds, shape.clone(), Some(opts.maxzoom), step, &tx, cancel)
+            .await?
+        {
+            return Ok(cancelled(&tx, step).await);
+        }
+    }
     if flag("download_elevation", true) && wants_hgt {
         let Some(_held) = cancel.guard(elevation_lock.lock()).await else {
             return Ok(cancelled(&tx, step).await);

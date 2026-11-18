@@ -1,10 +1,14 @@
 [
     {
         "name": "mapterhorn",
-        "type": "xyz",
-        "url": "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp",
+        "type": "pmtiles",
+        "path": "../data/sources/mapterhorn.pmtiles",
+        "extract_from": [
+            "https://download.mapterhorn.com/planet.pmtiles",
+            "https://download.mapterhorn.com/6-{x}-{y}.pmtiles"
+        ],
         "encoding": "terrarium",
-        "maxzoom": 14,
+        "maxzoom": 15,
         "clamp_min": -10
     }
 ]

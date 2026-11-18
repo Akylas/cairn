@@ -76,7 +76,7 @@ export AREA=rhone-alpes
 cairn download --area $AREA          # OSM extract from Geofabrik
 cairn basemap  --area $AREA          # vector basemap
 cairn routes   --area $AREA          # route relations
-cairn elevation --area $AREA         # .hgt tiles
+cairn elevation --area $AREA         # .hgt tiles, only if something still reads them
 cairn terrain  --area $AREA          # terrain-RGB
 cairn contours --area $AREA          # contour lines
 cairn valhalla-admins --area $AREA   # country boundaries for the graph (optional, once)

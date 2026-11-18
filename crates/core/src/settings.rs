@@ -22,6 +22,35 @@ pub struct AreaConfig {
     pub poly: Option<PathBuf>,
 }
 
+/// Where the Valhalla graph build gets the elevation it bakes road grades in from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingElevation {
+    /// Rendered on demand from the terrain sources in `sources.json`, so routing and terrain
+    /// share one copy of the ground and nothing is written to `elevation_tiles/`.
+    #[default]
+    Terrain,
+    /// 1-arcsecond `.hgt` files in `elevation_tiles/`, downloaded from the Skadi mirror.
+    Hgt,
+}
+
+impl RoutingElevation {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "terrain" => Some(Self::Terrain),
+            "hgt" => Some(Self::Hgt),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terrain => "terrain",
+            Self::Hgt => "hgt",
+        }
+    }
+}
+
 /// Every field carries `#[serde(default)]` so a settings file written by an older build still
 /// loads after new fields land - the alternative is an app that refuses to start after upgrade.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,6 +66,8 @@ pub struct Settings {
     pub tmp_dir: PathBuf,
     pub elevation_tiles_dir: PathBuf,
     pub sources_json: PathBuf,
+    /// Where the graph's elevation comes from. See [`RoutingElevation`].
+    pub routing_elevation: RoutingElevation,
     /// Override for JRE discovery; `None` means probe `$JAVA_HOME` then `$PATH`.
     pub java_home: Option<PathBuf>,
     pub planetiler_jar: Option<PathBuf>,
@@ -129,6 +160,7 @@ impl Settings {
             tmp_dir: repo_root.join("data/tmp"),
             elevation_tiles_dir: repo_root.join("elevation_tiles"),
             sources_json: repo_root.join("config/sources.json"),
+            routing_elevation: RoutingElevation::Terrain,
             java_home: None,
             planetiler_jar: None,
             planetiler_jar_url: Some(DEFAULT_JAR_URL.to_string()),
@@ -248,16 +280,22 @@ impl Settings {
 
     /// Where to look for `valhalla_build_tiles` and friends, in order. `PATH` is searched after
     /// all of these by the tool lookup itself.
+    ///
+    /// A checkout's own build comes before the copy bundled with the app. `cargo tauri dev` stages
+    /// the bundle into `target/debug/resources` without the libraries its load commands point at,
+    /// so that copy does not start - and it is as old as the last staging, where the build in the
+    /// submodule is the one that was just compiled. A packaged install has no checkout, so it
+    /// falls through to the bundle.
     pub fn valhalla_bin_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(dir) = &self.valhalla_bin_dir {
             dirs.push(dir.clone());
         }
+        dirs.push(self.repo_root.join("valhalla/build"));
         if let Some(dir) = &self.resource_dir {
             dirs.push(dir.join("valhalla"));
             dirs.push(dir.clone());
         }
-        dirs.push(self.repo_root.join("valhalla/build"));
         dirs
     }
 
@@ -352,6 +390,25 @@ mod tests {
         settings.resource_dir = Some(resources);
         settings.planetiler_jar = Some(chosen.clone());
         assert_eq!(settings.planetiler_jar_path(), Some(chosen));
+    }
+
+    /// The configured directory may be one that has since moved - a path stored by an older
+    /// checkout - and the bundled copy of a dev run cannot start. The checkout's own build is what
+    /// is left, and it must be tried before the bundle.
+    #[test]
+    fn a_checkouts_valhalla_build_is_tried_before_the_bundled_copy() {
+        let mut settings = Settings::for_repo(PathBuf::from("/repo"));
+        settings.valhalla_bin_dir = Some(PathBuf::from("/gone/valhalla/build"));
+        settings.resource_dir = Some(PathBuf::from("/app/resources"));
+        assert_eq!(
+            settings.valhalla_bin_dirs(),
+            vec![
+                PathBuf::from("/gone/valhalla/build"),
+                PathBuf::from("/repo/valhalla/build"),
+                PathBuf::from("/app/resources/valhalla"),
+                PathBuf::from("/app/resources"),
+            ]
+        );
     }
 
     /// The app is launched from wherever, and `tauri dev` launches it one level inside the

@@ -35,6 +35,8 @@
     const out = { ...spec, type: spec.type };
     for (const key of NUMBERS) out[key] = spec[key] == null ? "" : String(spec[key]);
     for (const key of ["url", "path", "encoding", "cache_dir"]) out[key] = spec[key] ?? "";
+    // one archive is a string in the file and several are a list; the form holds them a line each
+    out.extract_from = Array.isArray(spec.extract_from) ? spec.extract_from.join("\n") : (spec.extract_from ?? "");
     out.download = spec.download ?? null;
     return out;
   }
@@ -46,6 +48,9 @@
       if (text === "") delete out[key];
       else out[key] = Number(text);
     }
+    const origins = String(spec.extract_from ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+    if (origins.length === 0) delete out.extract_from;
+    else out.extract_from = origins.length === 1 ? origins[0] : origins;
     for (const key of ["url", "path", "encoding", "cache_dir"]) {
       if (!String(spec[key] ?? "").trim()) delete out[key];
       else out[key] = String(spec[key]).trim();
@@ -76,6 +81,18 @@
       spec: {
         name: "mapterhorn", type: "pmtiles", url: "https://download.mapterhorn.com/planet.pmtiles",
         encoding: "terrarium", maxzoom: 12, clamp_min: -10,
+      },
+    },
+    {
+      label: "mapterhorn · local file, built as you go (recommended)",
+      about: "A file that grows to cover each area you build, fetching only the tiles it lacks - z0–12 from the planet archive, z13–15 from the regional ones. One copy on disk, however many areas, and no tool to install. z15 is large: about 7 GB for an area the size of Rhône-Alpes, and each zoom is four times the one before.",
+      spec: {
+        name: "mapterhorn", type: "pmtiles", path: "../data/sources/mapterhorn.pmtiles",
+        extract_from: [
+          "https://download.mapterhorn.com/planet.pmtiles",
+          "https://download.mapterhorn.com/6-{x}-{y}.pmtiles",
+        ],
+        encoding: "terrarium", maxzoom: 15, clamp_min: -10,
       },
     },
     {
@@ -213,6 +230,15 @@
                    placeholder="/path/to/mapterhorn.pmtiles" />
           </label>
         </div>
+        {#if spec.path && !spec.url}
+          <label>
+            Build this file from
+            <span class="hint">optional: archives to grow it from, one per line. <code>{"{x}"}</code> and <code>{"{y}"}</code> in a URL name a region's archive by its z6 tile</span>
+            <textarea bind:value={spec.extract_from} oninput={touched} spellcheck="false" rows="2"
+                      class:bad={problemFor(i, "extract_from")}
+                      placeholder="https://download.mapterhorn.com/planet.pmtiles"></textarea>
+          </label>
+        {/if}
         {#if !spec.url && !spec.path}
           <details class="how">
             <summary>How to get a local extract of your region</summary>

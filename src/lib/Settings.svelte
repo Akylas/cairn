@@ -66,6 +66,16 @@
   <h3>Terrain sources</h3>
   <Sources />
 
+  <h3>Routing elevation</h3>
+  <label>
+    Elevation for the Valhalla graph
+    <span class="hint">terrain sources: no .hgt copy of the ground is kept. .hgt files: downloaded to the elevation tiles folder</span>
+    <select bind:value={settings.routing_elevation}>
+      <option value="terrain">From the terrain sources</option>
+      <option value="hgt">From .hgt files</option>
+    </select>
+  </label>
+
   <h3>Tools</h3>
   {#each OPTIONAL as [key, label, hint]}
     <label>

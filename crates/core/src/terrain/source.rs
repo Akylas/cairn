@@ -43,6 +43,11 @@ pub struct SourceSpec {
     /// Where the data is on disk. A tiled source reached over HTTP names a `url` instead.
     #[serde(default, skip_serializing_if = "path_is_empty")]
     pub path: PathBuf,
+    /// For a `pmtiles` source with a local `path`: the archive to build that file from. The file
+    /// is grown to cover each area as it is built, from the tiles of this archive that the area
+    /// needs, so no one has to cut an extract by hand. See [`super::extract`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_from: Option<Origins>,
     /// How elevation is packed into the tiles. Terrarium unless said otherwise, which is what
     /// every public terrain pyramid serves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +79,32 @@ pub struct SourceSpec {
     /// this version has never heard of.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Where a source's local file is built from: one archive, or several - mapterhorn's z0-12 planet
+/// archive and its per-region files for everything finer. Written either as a string or a list, so
+/// the common case stays one line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Origins {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Origins {
+    pub fn urls(&self) -> Vec<String> {
+        let all = match self {
+            Origins::One(url) => vec![url.clone()],
+            Origins::Many(urls) => urls.clone(),
+        };
+        all.into_iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect()
+    }
+}
+
+impl From<&str> for Origins {
+    fn from(url: &str) -> Self {
+        Origins::One(url.to_string())
+    }
 }
 
 fn path_is_empty(path: &PathBuf) -> bool {
@@ -190,6 +221,30 @@ pub fn validate(specs: &[SourceSpec]) -> Vec<Problem> {
             "pmtiles" => {
                 if !has_url && !has_path {
                     problem(index, "url", format!("{label} needs a URL or a file"));
+                }
+                if let Some(origins) = &spec.extract_from {
+                    let urls = origins.urls();
+                    if urls.is_empty() {
+                        problem(index, "extract_from", format!("{label}: `extract_from` is empty"));
+                    }
+                    for from in &urls {
+                        if !(from.starts_with("https://") || from.starts_with("http://")) {
+                            problem(
+                                index,
+                                "extract_from",
+                                format!("{label}: `{from}` must be an http(s) URL"),
+                            );
+                        }
+                    }
+                    if !has_path || has_url {
+                        problem(
+                            index,
+                            "path",
+                            format!(
+                                "{label}: `extract_from` builds a local file, so it needs a path and no url"
+                            ),
+                        );
+                    }
                 }
             }
             "raster" | "valhalla" | "hgt" => {
@@ -716,6 +771,44 @@ mod tests {
         write_specs(&path, &specs).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!dir.path().join("sources.json.part").exists());
+    }
+
+    /// One archive is a string and several are a list, and each is saved the way it was written.
+    #[test]
+    fn extract_from_keeps_the_shape_it_was_written_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sources.json");
+        let original = r##"[
+    {
+        "name": "one",
+        "type": "pmtiles",
+        "path": "a.pmtiles",
+        "extract_from": "https://h/planet.pmtiles"
+    },
+    {
+        "name": "many",
+        "type": "pmtiles",
+        "path": "b.pmtiles",
+        "extract_from": [
+            "https://h/planet.pmtiles",
+            "https://h/6-{x}-{y}.pmtiles"
+        ]
+    }
+]
+"##;
+        std::fs::write(&path, original).unwrap();
+        let specs = read_specs_raw(&path).unwrap();
+        assert_eq!(specs[0].extract_from.as_ref().unwrap().urls().len(), 1);
+        assert_eq!(specs[1].extract_from.as_ref().unwrap().urls().len(), 2);
+        assert!(validate(&specs).is_empty());
+        write_specs(&path, &specs).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let bad = vec![SourceSpec {
+            extract_from: Some(Origins::Many(vec!["ftp://h/p.pmtiles".into()])),
+            ..specs[0].clone()
+        }];
+        assert!(validate(&bad).iter().any(|p| p.field == "extract_from"));
     }
 
     #[test]

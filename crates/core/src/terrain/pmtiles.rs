@@ -346,6 +346,33 @@ impl Archive {
         self.range(offset, length).map(Some)
     }
 
+    /// Every tile the archive addresses, as `(tile id, absolute offset, length)`, in id order.
+    ///
+    /// A run of identical tiles is one directory entry; it is listed once per tile it covers, so
+    /// a caller that copies tiles sees each address. Nothing but directories is read.
+    pub fn addresses(&self) -> Result<Vec<(u64, u64, u32)>> {
+        let mut out = Vec::new();
+        let mut push = |entries: &[Entry], base: u64| {
+            for entry in entries.iter().filter(|e| e.run_length > 0) {
+                for k in 0..u64::from(entry.run_length) {
+                    out.push((entry.tile_id + k, base + entry.offset, entry.length));
+                }
+            }
+        };
+        push(&self.root, self.header.tile_data_offset);
+        for entry in self.root.iter().filter(|e| e.run_length == 0) {
+            let leaf = self.leaf(entry.offset, u64::from(entry.length))?;
+            push(&leaf, self.header.tile_data_offset);
+        }
+        out.sort_unstable_by_key(|a| a.0);
+        Ok(out)
+    }
+
+    /// Bytes at an absolute offset, as [`Self::addresses`] reports them.
+    pub fn blob(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        self.range(offset, length)
+    }
+
     /// Whether the archive has this tile, from its directories alone - nothing is read.
     pub fn contains(&self, z: u8, x: u32, y: u32) -> Result<bool> {
         Ok(self.locate(z, x, y)?.is_some())
@@ -443,9 +470,43 @@ pub fn zoom_of(tile_id: u64) -> u8 {
     zoom
 }
 
+/// The tile a Hilbert-curve id names: the inverse of [`zxy_to_tile_id`].
+pub fn tile_id_to_zxy(tile_id: u64) -> (u8, u32, u32) {
+    let zoom = zoom_of(tile_id);
+    let base = ((1u64 << (2 * zoom as u64)) - 1) / 3;
+    let n = 1u64 << zoom;
+    let (mut x, mut y) = (0u64, 0u64);
+    let mut t = tile_id - base;
+    let mut side = 1u64;
+    while side < n {
+        let rx = 1 & (t / 2);
+        let ry = 1 & (t ^ rx);
+        rotate(side, &mut x, &mut y, rx, ry);
+        x += side * rx;
+        y += side * ry;
+        t /= 4;
+        side *= 2;
+    }
+    (zoom, x as u32, y as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Going to an id and back must land on the same tile, or an extract writes tiles under the
+    /// wrong address - and nothing notices until a map shows terrain from somewhere else.
+    #[test]
+    fn tile_ids_round_trip() {
+        for z in 0..=6u8 {
+            for x in 0..(1u32 << z) {
+                for y in 0..(1u32 << z) {
+                    assert_eq!(tile_id_to_zxy(zxy_to_tile_id(z, x, y)), (z, x, y));
+                }
+            }
+        }
+        assert_eq!(tile_id_to_zxy(zxy_to_tile_id(12, 2137, 1456)), (12, 2137, 1456));
+    }
 
     /// The reference ids from the PMTiles specification. A wrong curve reads the wrong tile
     /// everywhere but the origin, where every ordering agrees.

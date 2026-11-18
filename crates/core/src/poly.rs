@@ -73,6 +73,29 @@ impl Polygon {
         Ok(shape)
     }
 
+    /// A number that is the same for the same shape and, for practical purposes, not for another.
+    /// For telling whether two runs were asked about the same outline.
+    pub fn fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut feed = |value: u64| {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        for (marker, rings) in [(1u64, &self.outers), (2, &self.holes)] {
+            feed(marker);
+            for ring in rings {
+                feed(ring.len() as u64);
+                for (lon, lat) in ring {
+                    feed(lon.to_bits());
+                    feed(lat.to_bits());
+                }
+            }
+        }
+        hash
+    }
+
     /// `(west, south, east, north)` over every outer ring.
     pub fn bounds(&self) -> (f64, f64, f64, f64) {
         let mut bounds = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);

@@ -1,7 +1,7 @@
 //! `cairn download` / `elevation` / `valhalla-tiles` - the steps that were shell before.
 
 use anyhow::{anyhow, Result};
-use cairn_core::settings::Settings;
+use cairn_core::settings::{RoutingElevation, Settings};
 use cairn_core::steps::external::{self, ToolJob};
 use cairn_core::steps::{download, state, StepEvent, StepId};
 use clap::Args as ClapArgs;
@@ -90,6 +90,13 @@ pub struct ToolArgs {
     /// Where valhalla_build_elevation writes. Defaults to <repo>/elevation_tiles.
     #[arg(long)]
     pub output: Option<std::path::PathBuf>,
+    /// Where the graph's elevation comes from: `terrain` renders it from the sources in
+    /// sources.json, `hgt` reads the `.hgt` files in the elevation directory. Defaults to terrain.
+    #[arg(long, value_parser = ["terrain", "hgt"])]
+    pub elevation_from: Option<String>,
+    /// sources.json, for `--elevation-from terrain`. Defaults to <repo>/config/sources.json.
+    #[arg(long)]
+    pub sources: Option<std::path::PathBuf>,
     /// Stop if the output is already there.
     #[arg(long)]
     pub skip_existing: bool,
@@ -108,17 +115,36 @@ pub struct ToolArgs {
 pub async fn elevation(settings: &Settings, args: ToolArgs) -> Result<()> {
     use cairn_core::steps::elevation as hgt;
 
+    let settings = &with_elevation_options(settings, &args);
+
     let out = args.output.clone().unwrap_or_else(|| settings.elevation_tiles_dir.clone());
     let bounds = match &args.bbox {
-        Some(raw) => {
-            let p: Vec<f64> = raw.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-            if p.len() != 4 {
-                return Err(anyhow!("--bbox wants west,south,east,north"));
-            }
-            (p[0], p[1], p[2], p[3])
-        }
-        None => area_bounds(settings, &args.area)?,
+        Some(raw) => parse_bbox(raw)?,
+        None => cairn_core::steps::extract_sources::area_bounds(settings, &args.area).await?,
     };
+
+    // sources built from a remote archive first: they are what the graph and terrain read by default
+    if !args.dry_run {
+        let shape = cairn_core::steps::extract_sources::area_shape(settings, &args.area);
+        super::terrain::grow_sources(
+            settings,
+            &settings.sources_json,
+            bounds,
+            shape.as_ref(),
+            Some(cairn_core::steps::extract_sources::ROUTING_MAXZOOM),
+        )
+        .await?;
+    }
+    if !cairn_core::steps::routing_elevation::hgt_needed(settings) {
+        println!("no .hgt tiles to download: nothing reads them");
+        let _ = state::mark_done(
+            &settings.area_dir(&args.area),
+            StepId::ElevationTiles,
+            None,
+            &BTreeMap::new(),
+        );
+        return Ok(());
+    }
 
     let tiles = hgt::tiles_for_bounds(bounds);
     println!(
@@ -154,25 +180,12 @@ pub async fn elevation(settings: &Settings, args: ToolArgs) -> Result<()> {
     Ok(())
 }
 
-/// The area's extent, from its basemap - the same source the terrain step uses, so the two cover
-/// the same ground.
-fn area_bounds(settings: &Settings, area: &str) -> Result<(f64, f64, f64, f64)> {
-    let raw = cairn_core::catalog::discover(&settings.output_root)?
-        .into_iter()
-        .find(|a| a.name == area)
-        .and_then(|a| {
-            a.artifacts
-                .iter()
-                .find(|x| x.kind == cairn_core::catalog::ArtifactKind::Basemap)?
-                .bounds
-                .clone()
-        })
-        .ok_or_else(|| anyhow!("no --bbox given and no basemap for `{area}` to take one from"))?;
+fn parse_bbox(raw: &str) -> Result<(f64, f64, f64, f64)> {
     let p: Vec<f64> = raw.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-    if p.len() != 4 {
-        return Err(anyhow!("the basemap's bounds are not west,south,east,north"));
+    match p[..] {
+        [w, s, e, n] => Ok((w, s, e, n)),
+        _ => Err(anyhow!("--bbox wants west,south,east,north")),
     }
-    Ok((p[0], p[1], p[2], p[3]))
 }
 
 fn bin(args: &ToolArgs, settings: &Settings, name: &str) -> Result<std::path::PathBuf> {
@@ -189,9 +202,24 @@ fn bin(args: &ToolArgs, settings: &Settings, name: &str) -> Result<std::path::Pa
     })
 }
 
+/// The settings a run uses: the saved ones, with what the command line says laid over them.
+fn with_elevation_options(settings: &Settings, args: &ToolArgs) -> Settings {
+    let mut settings = settings.clone();
+    if let Some(mode) = args.elevation_from.as_deref().and_then(RoutingElevation::parse) {
+        settings.routing_elevation = mode;
+    }
+    if let Some(sources) = &args.sources {
+        settings.sources_json = sources.clone();
+    }
+    settings
+}
+
 /// `valhalla_build_tiles` - the routing graph itself.
 pub async fn valhalla_tiles(settings: &Settings, args: ToolArgs) -> Result<()> {
-    let config = args.config.clone().unwrap_or_else(|| settings.valhalla_config_path());
+    use cairn_core::steps::routing_elevation;
+
+    let settings = &with_elevation_options(settings, &args);
+    let mut config = args.config.clone().unwrap_or_else(|| settings.valhalla_config_path());
     let pbf = args
         .input
         .clone()
@@ -202,6 +230,34 @@ pub async fn valhalla_tiles(settings: &Settings, args: ToolArgs) -> Result<()> {
             pbf.display(),
             args.area
         ));
+    }
+    // a dry run only prints, so it neither grows the sources nor starts the server it would need
+    let supply = if args.dry_run {
+        None
+    } else {
+        if settings.routing_elevation == RoutingElevation::Terrain {
+            let bounds = match &args.bbox {
+                Some(raw) => parse_bbox(raw)?,
+                None => {
+                    cairn_core::steps::extract_sources::area_bounds(settings, &args.area).await?
+                }
+            };
+            let shape = cairn_core::steps::extract_sources::area_shape(settings, &args.area);
+            super::terrain::grow_sources(
+                settings,
+                &settings.sources_json,
+                bounds,
+                shape.as_ref(),
+                Some(cairn_core::steps::extract_sources::ROUTING_MAXZOOM),
+            )
+            .await?;
+        }
+        routing_elevation::prepare(settings, &args.area, &config, settings.routing_elevation)
+            .await?
+    };
+    if let Some(supply) = &supply {
+        println!("elevation: from the terrain sources in {}", settings.sources_json.display());
+        config = supply.config.clone();
     }
     let mut tool_args =
         vec!["-c".to_string(), config.display().to_string(), pbf.display().to_string()];
@@ -218,7 +274,11 @@ pub async fn valhalla_tiles(settings: &Settings, args: ToolArgs) -> Result<()> {
         working_dir: settings.repo_root.clone(),
         parse: external::valhalla_line,
     };
-    run_tool(settings, args, job, out).await
+    let result = run_tool(settings, args, job, out).await;
+    if let Some(supply) = supply {
+        println!("{}", routing_elevation::describe(supply.finish().await));
+    }
+    result
 }
 
 /// `valhalla_build_admins` - the country and state boundaries the graph builder looks nodes up in.

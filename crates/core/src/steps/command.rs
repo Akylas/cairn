@@ -61,7 +61,7 @@ pub fn argv(
 
     let defs = options::for_step(step);
     match style(step) {
-        Style::Area => {}
+        Style::Area => routing_elevation(settings, step, &mut out),
         Style::Overrides => {
             planetiler_paths(settings, &mut out);
             for def in &defs {
@@ -138,6 +138,24 @@ fn planetiler_paths(settings: &Settings, out: &mut Vec<String>) {
 /// The steps that sample the elevation sources, and so take the same source and clip flags.
 fn reads_sources(step: StepId) -> bool {
     matches!(step, StepId::TerrainRgb | StepId::Contours)
+}
+
+/// Where the graph's elevation comes from, for the two steps that care. The command line's default
+/// is the terrain sources, so only the other choice, and a `sources.json` that is not the default,
+/// need saying.
+fn routing_elevation(settings: &Settings, step: StepId, out: &mut Vec<String>) {
+    if !matches!(step, StepId::ElevationTiles | StepId::ValhallaTiles) {
+        return;
+    }
+    let defaults = Settings::for_repo(settings.repo_root.clone());
+    if settings.routing_elevation != defaults.routing_elevation {
+        out.push("--elevation-from".into());
+        out.push(settings.routing_elevation.as_str().into());
+    }
+    if settings.sources_json != defaults.sources_json {
+        out.push("--sources".into());
+        out.push(settings.sources_json.display().to_string());
+    }
 }
 
 fn terrain_paths(settings: &Settings, out: &mut Vec<String>) {
@@ -222,6 +240,23 @@ mod tests {
 
     fn values(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    /// The graph defaults to the terrain sources on the command line, so a line only says so when
+    /// the app was set to the other thing.
+    #[test]
+    fn the_routing_elevation_is_on_the_line_only_when_it_is_not_the_default() {
+        use crate::settings::RoutingElevation;
+        let mut s = settings();
+        let line = argv(&s, StepId::ValhallaTiles, "alps", &BTreeMap::new(), &[]);
+        assert!(!line.contains(&"--elevation-from".to_string()), "{line:?}");
+
+        s.routing_elevation = RoutingElevation::Hgt;
+        let line = argv(&s, StepId::ValhallaTiles, "alps", &BTreeMap::new(), &[]);
+        let at = line.iter().position(|a| a == "--elevation-from").expect("said on the line");
+        assert_eq!(line[at + 1], "hgt");
+        let other = argv(&s, StepId::ValhallaAdmins, "alps", &BTreeMap::new(), &[]);
+        assert!(!other.contains(&"--elevation-from".to_string()));
     }
 
     /// Your own europe terrain form, which printed three flags the parser rejects or misread.

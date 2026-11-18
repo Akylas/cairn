@@ -5,8 +5,10 @@ pub mod command;
 pub mod download;
 pub mod elevation;
 pub mod external;
+pub mod extract_sources;
 pub mod options;
 pub mod planetiler;
+pub mod routing_elevation;
 pub mod state;
 
 use serde::{Deserialize, Serialize};
@@ -71,10 +73,12 @@ impl StepId {
                  is why it is a step of its own rather than planetiler's `--download`."
             }
             StepId::ElevationTiles => {
-                "Downloads the 1-degree .hgt tiles covering the area from the public Skadi \
-                 mirror, decompressed. The Valhalla graph bakes elevation in during its own \
-                 build, so these have to exist before the graph is built - and the terrain step \
-                 reads the same files afterwards."
+                "Makes sure the elevation the area needs is on this machine. A source in \
+                 sources.json with an `extract_from` is a local file grown to cover the area, \
+                 fetching only the tiles it lacks from the remote archive (mapterhorn). The \
+                 1-degree .hgt tiles from the public Skadi mirror are downloaded only when a \
+                 source reads them or the graph is set to. Terrain, contours and the graph all \
+                 call this themselves, so it is rarely run on its own."
             }
             StepId::Basemap => {
                 "Planetiler over the OSM extract, with the bundled OpenMapTiles fork or a YAML \
